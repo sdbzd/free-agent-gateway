@@ -1,0 +1,247 @@
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use thiserror::Error;
+
+/// Unified error type for the gateway.
+#[derive(Debug, Error)]
+pub enum GatewayError {
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("Provider not found: {0}")]
+    ProviderNotFound(String),
+
+    #[error("Model not found: {0}")]
+    ModelNotFound(String),
+
+    #[error("No available keys for provider: {0}")]
+    NoAvailableKeys(String),
+
+    #[error("All providers failed, including fallbacks")]
+    AllProvidersFailed,
+
+    #[error("Upstream request failed: {0}")]
+    UpstreamError(String),
+
+    #[error("HTTP error {status}: {message}")]
+    HttpError { status: u16, message: String },
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("State persistence error: {0}")]
+    StateError(String),
+
+    #[error("Rate limited by upstream")]
+    RateLimited,
+
+    #[error("Authentication failed with upstream")]
+    AuthFailed,
+
+    #[error("Provider disabled: {0}")]
+    ProviderDisabled(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("YAML error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+
+    #[error("Database error: {0}")]
+    Database(String),
+}
+
+impl From<rusqlite::Error> for GatewayError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e.to_string())
+    }
+}
+
+impl IntoResponse for GatewayError {
+    fn into_response(self) -> Response {
+        let (status, error_type, message) = match &self {
+            Self::Config(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_error",
+                msg.clone(),
+            ),
+            Self::ProviderNotFound(msg) => {
+                (StatusCode::NOT_FOUND, "provider_not_found", msg.clone())
+            }
+            Self::ModelNotFound(msg) => (StatusCode::NOT_FOUND, "model_not_found", msg.clone()),
+            Self::NoAvailableKeys(msg) => (StatusCode::SERVICE_UNAVAILABLE, "no_keys", msg.clone()),
+            Self::AllProvidersFailed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all_providers_failed",
+                "All providers and fallbacks exhausted".into(),
+            ),
+            Self::UpstreamError(_) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "Upstream provider request failed".into(),
+            ),
+            Self::HttpError { status, message } => (
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+                "http_error",
+                format!("Upstream provider returned HTTP {status}: {message}"),
+            ),
+            Self::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "timeout", msg.clone()),
+            Self::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "invalid_request", msg.clone()),
+            Self::StateError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "state_error",
+                msg.clone(),
+            ),
+            Self::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Rate limited by upstream provider".into(),
+            ),
+            Self::AuthFailed => (
+                StatusCode::UNAUTHORIZED,
+                "auth_failed",
+                "Authentication failed with upstream provider".into(),
+            ),
+            Self::ProviderDisabled(msg) => {
+                (StatusCode::FORBIDDEN, "provider_disabled", msg.clone())
+            }
+            Self::Serialization(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "serialization_error",
+                msg.clone(),
+            ),
+            Self::Io(_) | Self::Reqwest(_) | Self::Json(_) | Self::Yaml(_) | Self::Database(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                self.to_string(),
+            ),
+        };
+
+        let body = serde_json::json!({
+            "error": {
+                "type": error_type,
+                "message": message,
+                "param": serde_json::Value::Null,
+                "code": error_type,
+            }
+        });
+
+        (status, axum::Json(body)).into_response()
+    }
+}
+
+impl GatewayError {
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::HttpError { status, .. } => *status,
+            Self::RateLimited => 429,
+            Self::AuthFailed => 401,
+            Self::Timeout(_) => 504,
+            _ => 500,
+        }
+    }
+
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config_error",
+            Self::ProviderNotFound(_) => "provider_not_found",
+            Self::ModelNotFound(_) => "model_not_found",
+            Self::NoAvailableKeys(_) => "no_keys",
+            Self::AllProvidersFailed => "all_providers_failed",
+            Self::UpstreamError(_) | Self::Reqwest(_) => "upstream_error",
+            Self::HttpError { status: 429, .. } => "rate_limited",
+            Self::HttpError { status: 401, .. } => "auth_failed",
+            Self::HttpError { status: 403, .. } => "auth_failed",
+            Self::HttpError { status: 503, .. } => "upstream_error",
+            Self::HttpError { .. } => "upstream_http_error",
+            Self::Timeout(_) => "timeout",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::StateError(_) => "state_error",
+            Self::RateLimited => "rate_limited",
+            Self::AuthFailed => "auth_failed",
+            Self::ProviderDisabled(_) => "provider_disabled",
+            Self::Serialization(_) | Self::Json(_) | Self::Yaml(_) => "serialization_error",
+            Self::Io(_) => "io_error",
+            Self::Database(_) => "database_error",
+        }
+    }
+}
+
+/// Convenient Result alias.
+pub type GatewayResult<T> = Result<T, GatewayError>;
+
+pub fn sanitize_diagnostic(message: &str) -> String {
+    ["Bearer ", "key=", "token="]
+        .into_iter()
+        .fold(message.to_string(), |value, marker| {
+            redact_marker_value(&value, marker)
+        })
+}
+
+fn redact_marker_value(input: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(position) = rest.find(marker) {
+        let value_start = position + marker.len();
+        output.push_str(&rest[..value_start]);
+        let value = &rest[value_start..];
+        let value_end = value
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | '&' | '"' | '\'' | '}' | ']')
+            })
+            .unwrap_or(value.len());
+        output.push_str("[REDACTED]");
+        rest = &value[value_end..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, response::IntoResponse};
+
+    use super::GatewayError;
+    use super::sanitize_diagnostic;
+
+    #[tokio::test]
+    async fn error_response_uses_openai_compatible_envelope() {
+        let response = GatewayError::ModelNotFound("missing".into()).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "model_not_found");
+        assert_eq!(json["error"]["code"], "model_not_found");
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["message"].is_string());
+    }
+
+    #[test]
+    fn diagnostic_sanitizer_removes_sensitive_values() {
+        let sanitized = sanitize_diagnostic(
+            "Authorization: Bearer secret-token key=secret-key token=secret-token-2",
+        );
+
+        assert!(!sanitized.contains("secret-token"));
+        assert!(!sanitized.contains("secret-key"));
+        assert!(sanitized.contains("Bearer [REDACTED]"));
+        assert!(sanitized.contains("key=[REDACTED]"));
+        assert!(sanitized.contains("token=[REDACTED]"));
+    }
+}

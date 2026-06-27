@@ -1,0 +1,44 @@
+# Rust build output
+/target
+
+# Runtime state files (generated at startup)
+state.json
+models.cache
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment / secrets
+.env
+*.env.local
+
+# Logs
+*.log
+
+config.yaml
+
+# Runtime / data
+*.json
+!config.yaml.sample
+state.db
+*.err
+gateway.log
+
+# Dev / temp scripts
+_apply_patch.ps1
+prompt.md
+
+# Compiled binary
+/bin/
+
+# OMO session data
+.omo/

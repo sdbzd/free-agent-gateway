@@ -1,0 +1,73 @@
+[package]
+name = "agent-gateway"
+version = "0.1.0"
+edition = "2024"
+description = "Agent Gateway - Unified AI entry for the OpenClaw ecosystem"
+license = "MIT"
+readme = "README.md"
+keywords = ["ai", "gateway", "agent", "openai", "proxy"]
+categories = ["web-programming", "asynchronous"]
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["json", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "compression-gzip"] }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = "0.1"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Tracing / logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async trait support
+async-trait = "0.1"
+
+# Concurrent collections
+dashmap = "6"
+
+# Bytes
+bytes = "1"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+parking_lot = "0.12"
+rand = "0.8"
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+url = "2"
+regex = "1"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+mockito = "1"
+tokio-test = "0.4"
+pretty_assertions = "1"
+
+[[bin]]
+name = "free-agent-gateway"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,173 @@
+# Agent Gateway Configuration
+# ================================
+
+# Server settings
+server:
+  host: "127.0.0.1"
+  port: 9000
+  # Log level: error, warn, info, debug
+  log_level: "info"
+  # Request timeout in seconds
+  request_timeout: 120
+  # SSE keep-alive interval in seconds
+  sse_keepalive: 15
+
+# Routing strategy: round_robin, random, least_failed, priority
+routing:
+  strategy: "least_failed"
+  # Consecutive failure threshold before cooldown
+  fail_threshold: 3
+  # Key cooldown duration in seconds
+  cooldown_seconds: 600
+  # Auto-discover models from providers
+  auto_discover: true
+
+# Provider fallback order
+fallback:
+  - "github"
+  - "nvidia"
+  - "opencode"
+  - "ollama"
+
+# Model aliases for agents
+agents:
+  hermes:
+    default_model: "coding"
+  openclaw:
+    default_model: "chat"
+  zeroclaw:
+    default_model: "chat"
+  document:
+    default_model: "local"
+  coding_agent:
+    default_model: "coding"
+  mcp_agent:
+    default_model: "chat"
+
+# Model alias definitions
+models:
+  coding:
+    provider: "github"
+    model: "openai/gpt-4.1-mini"
+  chat:
+    provider: "nvidia"
+    model: "meta/llama-3.1-70b-instruct"
+  local:
+    provider: "ollama"
+    model: "qwen2.5:7b"
+  reasoning:
+    provider: "github"
+    model: "openai/o3-mini"
+  embedding:
+    provider: "nvidia"
+    model: "nvidia/nv-embedqa-e5-v5"
+
+# Provider configurations
+providers:
+
+  openrouter:
+    type: "openai_compatible"
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    # Keys rotate automatically on failure
+    keys:
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+
+    # Health check settings
+    health_check_model: "openai/gpt-4.1-mini"
+    timeout_seconds: 30
+
+  github:
+    type: "github_models"
+    enabled: false
+    base_url: "https://models.inference.ai.azure.com"
+    # Keys rotate automatically on failure
+    keys:
+      - "${GITHUB_TOKEN_1}"
+      - "${GITHUB_TOKEN_2}"
+      - "${GITHUB_TOKEN_3}"
+    # Health check settings
+    #health_check_model: "openai/gpt-4.1-mini"
+    timeout_seconds: 30
+
+  nvidia:
+    type: "openai_compatible"
+    enabled: true
+    base_url: "https://integrate.api.nvidia.com/v1"
+    keys:
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+    health_check_model: "meta/llama-3.1-70b-instruct"
+    timeout_seconds: 30
+
+  opencode:
+    type: "openai_compatible"
+    enabled: true
+    base_url: "https://opencode.ai/zen/v1"
+    keys:
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+      - value: "<YOUR_API_KEY>"
+        tier: free
+
+    health_check_model: "gpt-4o-mini"
+    timeout_seconds: 30
+
+  ollama:
+    type: "ollama"
+    enabled: false
+    # Ollama typically runs locally without auth
+    base_url: "http://localhost:11434"
+    keys:
+      - "ollama"
+    health_check_model: "qwen2.5:7b"
+    timeout_seconds: 120
+    # Ollama is the ultimate fallback
+    priority: 100
+
+# Health watcher settings
+watcher:
+  enabled: true
+  # Check interval in seconds
+  interval_seconds: 60
+  # Timeout for each health check
+  check_timeout_seconds: 10
+
+# State persistence
+state:
+  # Auto-save interval in seconds
+  save_interval_seconds: 30
+  # File paths (relative to executable)
+  state_file: "state.json"
+  models_cache_file: "models.cache"
+
+# CORS settings
+cors:
+  allowed_origins:
+    - "*"
+  allowed_methods:
+    - "GET"
+    - "POST"
+    - "OPTIONS"
+  allowed_headers:
+    - "Authorization"
+    - "Content-Type"
+    - "X-Request-Id"
+    - "X-Agent-Name"
