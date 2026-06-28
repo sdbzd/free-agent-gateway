@@ -24,11 +24,122 @@ const COOLDOWN_ESCALATION_S: &[u64] = &[120, 600, 3600, 86400];
 /// Global counter for round-robin key selection.
 static ROUND_ROBIN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Candidate metadata used by the router to compare keys across providers
+/// without exposing raw key state or credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeKeyCandidate {
+    pub key: String,
+    pub usage_sort_key: (u32, u32, u32, u32, u32),
+    pub fail_count: u32,
+    pub total_fail_count: u64,
+}
+
 /// Create a stable, non-credential identifier for persisted key metadata.
 pub fn key_fingerprint(key: &str) -> String {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     format!("key-{:016x}", hasher.finish())
+}
+
+fn key_usage_score(key: &KeyState, now_secs: u64) -> u32 {
+    let now_min = now_secs / 60;
+    let now_day = now_secs / 86400;
+    let rpm_pct = key
+        .rpm_limit
+        .map(|limit| {
+            percent_used(
+                current_minute_count(key.rpm_window_start, key.rpm_count, now_min),
+                limit,
+            )
+        })
+        .unwrap_or(0);
+    let rpd_pct = key
+        .rpd_limit
+        .map(|limit| {
+            percent_used(
+                current_day_count(key.rpd_window_start, key.rpd_count, now_day),
+                limit,
+            )
+        })
+        .unwrap_or(0);
+    let tpm_used = current_minute_count(
+        key.rpm_window_start,
+        key.tpm_prompt_count
+            .saturating_add(key.tpm_completion_count),
+        now_min,
+    );
+    let tpd_used = current_day_count(
+        key.rpd_window_start,
+        key.tpd_prompt_count
+            .saturating_add(key.tpd_completion_count),
+        now_day,
+    );
+    let tpm_pct = key
+        .tpm_limit
+        .map(|limit| percent_used(tpm_used, limit))
+        .unwrap_or(0);
+    let tpd_pct = key
+        .tpd_limit
+        .map(|limit| percent_used(tpd_used, limit))
+        .unwrap_or(0);
+
+    rpm_pct.max(rpd_pct).max(tpm_pct).max(tpd_pct)
+}
+
+fn key_usage_sort_key(key: &KeyState, now_secs: u64) -> (u32, u32, u32, u32, u32) {
+    let now_min = now_secs / 60;
+    let now_day = now_secs / 86400;
+    let minute_count = current_minute_count(key.rpm_window_start, key.rpm_count, now_min);
+    let day_count = current_day_count(key.rpd_window_start, key.rpd_count, now_day);
+    (
+        key_usage_score(key, now_secs),
+        day_count,
+        minute_count,
+        key.fail_count,
+        key.total_fail_count.min(u32::MAX as u64) as u32,
+    )
+}
+
+fn current_minute_count(window_start: u64, count: u32, now_min: u64) -> u32 {
+    if window_start == now_min { count } else { 0 }
+}
+
+fn current_day_count(window_start: u64, count: u32, now_day: u64) -> u32 {
+    if window_start == now_day { count } else { 0 }
+}
+
+fn percent_used(used: u32, limit: u32) -> u32 {
+    if limit == 0 {
+        return 100;
+    }
+    used.saturating_mul(100) / limit
+}
+
+fn tighten_observed_limit(limit: &mut Option<u32>, observed: u32) {
+    if observed == 0 {
+        return;
+    }
+    *limit = Some(limit.map_or(observed, |current| current.min(observed)));
+}
+
+fn can_observed_limit_update(source: &Option<String>) -> bool {
+    !matches!(source.as_deref(), Some("config" | "official_api"))
+}
+
+fn set_request_limit(
+    limit: &mut Option<u32>,
+    source: &mut Option<String>,
+    value: u32,
+    new_source: &str,
+) {
+    if value == 0 {
+        return;
+    }
+    if matches!(source.as_deref(), Some("config")) && new_source != "config" {
+        return;
+    }
+    *limit = Some(value);
+    *source = Some(new_source.to_string());
 }
 
 /// Key pool for a single provider.
@@ -52,6 +163,8 @@ impl KeyPool {
                 let mut state = KeyState::with_tier(key.value().to_string(), key.tier());
                 state.rpm_limit = key.rpm_limit();
                 state.rpd_limit = key.rpd_limit();
+                state.rpm_limit_source = key.rpm_limit().map(|_| "config".to_string());
+                state.rpd_limit_source = key.rpd_limit().map(|_| "config".to_string());
                 state.tpm_limit = key.tpm_limit();
                 state.tpd_limit = key.tpd_limit();
                 state
@@ -115,33 +228,7 @@ impl KeyPool {
                 // Prefer the key with the smallest max-usage (most headroom).
                 available_indices
                     .iter()
-                    .min_by_key(|&&i| {
-                        let k = &keys[i];
-                        let now_secs = chrono::Utc::now().timestamp() as u64;
-                        let now_min = now_secs / 60;
-                        let now_day = now_secs / 86400;
-                        let rpm_pct = k.rpm_limit.map(|lim| {
-                            if lim == 0 { return 100u32; }
-                            let cnt = if k.rpm_window_start == now_min { k.rpm_count } else { 0 };
-                            (cnt * 100) / lim
-                        }).unwrap_or(0);
-                        let rpd_pct = k.rpd_limit.map(|lim| {
-                            if lim == 0 { return 100u32; }
-                            let cnt = if k.rpd_window_start == now_day { k.rpd_count } else { 0 };
-                            (cnt * 100) / lim
-                        }).unwrap_or(0);
-                        let tpm_pct = k.tpm_limit.map(|lim| {
-                            if lim == 0 { return 100u32; }
-                            let used = if k.rpm_window_start == now_min { k.tpm_prompt_count + k.tpm_completion_count } else { 0 };
-                            (used * 100) / lim
-                        }).unwrap_or(0);
-                        let tpd_pct = k.tpd_limit.map(|lim| {
-                            if lim == 0 { return 100u32; }
-                            let used = if k.rpd_window_start == now_day { k.tpd_prompt_count + k.tpd_completion_count } else { 0 };
-                            (used * 100) / lim
-                        }).unwrap_or(0);
-                        std::cmp::max(rpm_pct, std::cmp::max(rpd_pct, std::cmp::max(tpm_pct, tpd_pct)))
-                    })
+                    .min_by_key(|&&i| key_usage_sort_key(&keys[i], now))
                     .copied()
                     .unwrap_or(available_indices[0])
             }
@@ -176,8 +263,29 @@ impl KeyPool {
             configured.models_last_error = saved.models_last_error.clone();
             configured.fail_count = saved.fail_count;
             configured.cooldown_until = saved.cooldown_until;
+            configured.last_success_at = saved.last_success_at;
+            configured.last_error_at = saved.last_error_at;
+            configured.last_error_status = saved.last_error_status;
+            configured.status_updated_at = saved.status_updated_at;
+            configured.last_recovered_at = saved.last_recovered_at;
             configured.success_count = saved.success_count;
             configured.total_fail_count = saved.total_fail_count;
+            if configured.rpm_limit.is_none() {
+                configured.rpm_limit = saved.rpm_limit;
+                configured.rpm_limit_source = saved.rpm_limit_source.clone();
+            }
+            if configured.rpd_limit.is_none() {
+                configured.rpd_limit = saved.rpd_limit;
+                configured.rpd_limit_source = saved.rpd_limit_source.clone();
+            }
+            configured.rpm_count = saved.rpm_count;
+            configured.rpd_count = saved.rpd_count;
+            configured.tpm_prompt_count = saved.tpm_prompt_count;
+            configured.tpm_completion_count = saved.tpm_completion_count;
+            configured.tpd_prompt_count = saved.tpd_prompt_count;
+            configured.tpd_completion_count = saved.tpd_completion_count;
+            configured.rpm_window_start = saved.rpm_window_start;
+            configured.rpd_window_start = saved.rpd_window_start;
             configured.key_id = configured_id;
         }
         self.recover_expired(&mut keys);
@@ -193,6 +301,8 @@ impl KeyPool {
                         key.status = KeyStatus::Available;
                         key.fail_count = 0;
                         key.cooldown_until = None;
+                        key.status_updated_at = Some(now);
+                        key.last_recovered_at = Some(now);
                         tracing::info!(
                             provider = %self.provider_name,
                             key = %key.masked_key(),
@@ -205,6 +315,8 @@ impl KeyPool {
                         // (2min → 10min → 1hr → 24hr) persists across recovery cycles
                         key.status = KeyStatus::Available;
                         key.cooldown_until = None;
+                        key.status_updated_at = Some(now);
+                        key.last_recovered_at = Some(now);
                         tracing::info!(
                             provider = %self.provider_name,
                             key = %key.masked_key(),
@@ -232,6 +344,7 @@ impl KeyPool {
         if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
             k.success_count += 1;
             k.fail_count = 0;
+            k.last_success_at = Some(now);
 
             // Reset rate windows and increment counters
             k.reset_rate_windows(now);
@@ -253,14 +366,87 @@ impl KeyPool {
         self.provider_cooldown_until.store(0, Ordering::Relaxed);
     }
 
+    /// Reserve one request against RPM/RPD before sending it upstream.
+    ///
+    /// This prevents concurrent callers from all selecting the same key while
+    /// seeing stale counters. Token counters are still recorded after success.
+    pub fn reserve_key(&self, key: &str) -> bool {
+        let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
+        self.recover_expired(&mut keys);
+        let Some(k) = keys.iter_mut().find(|k| k.key == key) else {
+            return false;
+        };
+        k.reset_rate_windows(now);
+        if k.status != KeyStatus::Available || k.is_rate_limited(now) {
+            return false;
+        }
+        k.rpm_count = k.rpm_count.saturating_add(1);
+        k.rpd_count = k.rpd_count.saturating_add(1);
+        true
+    }
+
+    /// Report success for a request that was already reserved.
+    pub fn report_reserved_success(
+        &self,
+        key: &str,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+    ) {
+        let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
+        if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
+            k.success_count += 1;
+            k.fail_count = 0;
+            k.last_success_at = Some(now);
+            k.reset_rate_windows(now);
+
+            if let Some(p) = prompt_tokens {
+                k.tpm_prompt_count = k.tpm_prompt_count.saturating_add(p);
+                k.tpd_prompt_count = k.tpd_prompt_count.saturating_add(p);
+            }
+            if let Some(c) = completion_tokens {
+                k.tpm_completion_count = k.tpm_completion_count.saturating_add(c);
+                k.tpd_completion_count = k.tpd_completion_count.saturating_add(c);
+            }
+        }
+
+        self.provider_fail_count.store(0, Ordering::Relaxed);
+        self.provider_cooldown_until.store(0, Ordering::Relaxed);
+    }
+
     /// Report a failure for a key, handling automatic status transitions.
     pub fn report_failure(&self, key: &str, http_status: u16) {
+        self.report_failure_with_retry_after(key, http_status, None);
+    }
+
+    /// Report a transient upstream failure without auth/rate-limit special handling.
+    pub fn report_transient_failure(&self, key: &str, http_status: u16) {
         let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
         if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
+            self.record_general_failure(k, http_status, now);
+        }
+        self.record_provider_failure(keys.len() as u64, now);
+    }
+
+    /// Report a failure with optional upstream retry guidance.
+    pub fn report_failure_with_retry_after(
+        &self,
+        key: &str,
+        http_status: u16,
+        retry_after_seconds: Option<u64>,
+    ) {
+        let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
+        if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
+            k.last_error_at = Some(now);
+            k.last_error_status = Some(http_status);
             match http_status {
                 401 | 403 => {
                     // Auth failure → permanently disabled
                     k.status = KeyStatus::Disabled;
+                    k.status_updated_at = Some(now);
                     k.total_fail_count += 1;
                     tracing::warn!(
                         provider = %self.provider_name,
@@ -274,11 +460,35 @@ impl KeyPool {
                     // Track consecutive 429 hits per key to pick the right tier.
                     // Stored as a simple counter in the key state's fail_count field
                     // (we reset fail_count on success but preserve it for 429 tracking).
+                    k.reset_rate_windows(now);
+                    let now_min = now / 60;
+                    let now_day = now / 86400;
+                    let observed_minute =
+                        current_minute_count(k.rpm_window_start, k.rpm_count, now_min);
+                    let observed_day = current_day_count(k.rpd_window_start, k.rpd_count, now_day);
+                    match retry_after_seconds {
+                        Some(seconds) if seconds <= 300 => {
+                            if can_observed_limit_update(&k.rpm_limit_source) {
+                                tighten_observed_limit(&mut k.rpm_limit, observed_minute);
+                                if k.rpm_limit.is_some() {
+                                    k.rpm_limit_source = Some("runtime_429".to_string());
+                                }
+                            }
+                        }
+                        Some(_) | None => {
+                            if can_observed_limit_update(&k.rpd_limit_source) {
+                                tighten_observed_limit(&mut k.rpd_limit, observed_day);
+                                if k.rpd_limit.is_some() {
+                                    k.rpd_limit_source = Some("runtime_429".to_string());
+                                }
+                            }
+                        }
+                    }
                     let tier = (k.fail_count as usize).min(COOLDOWN_ESCALATION_S.len() - 1);
-                    let cooldown_s = COOLDOWN_ESCALATION_S[tier];
+                    let cooldown_s = retry_after_seconds.unwrap_or(COOLDOWN_ESCALATION_S[tier]);
                     k.status = KeyStatus::RateLimited;
-                    k.cooldown_until =
-                        Some(chrono::Utc::now().timestamp() as u64 + cooldown_s);
+                    k.cooldown_until = Some(now + cooldown_s);
+                    k.status_updated_at = Some(now);
                     k.fail_count += 1;
                     k.total_fail_count += 1;
                     tracing::warn!(
@@ -290,35 +500,47 @@ impl KeyPool {
                     );
                 }
                 _ => {
-                    // General failure (5xx, timeout, etc.)
-                    k.fail_count += 1;
-                    k.total_fail_count += 1;
-
-                    if k.fail_count >= self.routing.fail_threshold {
-                        k.status = KeyStatus::Cooldown;
-                        k.cooldown_until = Some(
-                            chrono::Utc::now().timestamp() as u64 + self.routing.cooldown_seconds,
-                        );
-                        tracing::warn!(
-                            provider = %self.provider_name,
-                            key = %k.masked_key(),
-                            fail_count = k.fail_count,
-                            "Key entering cooldown due to consecutive failures"
-                        );
+                    self.record_general_failure(k, http_status, now);
                 }
             }
-        }
 
-        // Provider-level failure tracking.
-        // If aggregate failures across all keys exceed threshold,
-        // enter provider cooldown.
+            if matches!(http_status, 401 | 403 | 429) {
+                return;
+            }
+
+            // Provider-level failure tracking.
+            // If aggregate failures across all keys exceed threshold,
+            // enter provider cooldown.
+            self.record_provider_failure(keys.len() as u64, now);
+        }
+    }
+
+    fn record_general_failure(&self, key: &mut KeyState, http_status: u16, now: u64) {
+        key.last_error_at = Some(now);
+        key.last_error_status = Some(http_status);
+        key.fail_count += 1;
+        key.total_fail_count += 1;
+
+        if key.fail_count >= self.routing.fail_threshold {
+            key.status = KeyStatus::Cooldown;
+            key.cooldown_until = Some(now + self.routing.cooldown_seconds);
+            key.status_updated_at = Some(now);
+            tracing::warn!(
+                provider = %self.provider_name,
+                key = %key.masked_key(),
+                fail_count = key.fail_count,
+                "Key entering cooldown due to consecutive transient failures"
+            );
+        }
+    }
+
+    fn record_provider_failure(&self, key_count: u64, now: u64) {
         let prev_fails = self.provider_fail_count.fetch_add(1, Ordering::Relaxed);
-        let key_count = keys.len() as u64;
         let threshold = key_count * self.routing.fail_threshold as u64;
         if prev_fails + 1 >= threshold {
-            let cooldown_until =
-                chrono::Utc::now().timestamp() as u64 + self.routing.cooldown_seconds;
-            self.provider_cooldown_until.store(cooldown_until, Ordering::Relaxed);
+            let cooldown_until = now + self.routing.cooldown_seconds;
+            self.provider_cooldown_until
+                .store(cooldown_until, Ordering::Relaxed);
             tracing::warn!(
                 provider = %self.provider_name,
                 fail_count = prev_fails + 1,
@@ -328,14 +550,17 @@ impl KeyPool {
             );
         }
     }
-    }
 
     /// Get the number of available keys.
     pub fn available_count(&self) -> usize {
         let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
         self.recover_expired(&mut keys);
+        for key in keys.iter_mut() {
+            key.reset_rate_windows(now);
+        }
         keys.iter()
-            .filter(|k| k.status == KeyStatus::Available)
+            .filter(|k| k.status == KeyStatus::Available && !k.is_rate_limited(now))
             .count()
     }
 
@@ -346,7 +571,8 @@ impl KeyPool {
 
     /// Get a snapshot of all key states (keys are masked).
     pub fn snapshot(&self) -> Vec<KeyState> {
-        let keys = self.keys.read();
+        let mut keys = self.keys.write();
+        self.recover_expired(&mut keys);
         keys.iter()
             .map(|k| KeyState {
                 key: k.masked_key(),
@@ -358,10 +584,17 @@ impl KeyPool {
                 status: k.status,
                 fail_count: k.fail_count,
                 cooldown_until: k.cooldown_until,
+                last_success_at: k.last_success_at,
+                last_error_at: k.last_error_at,
+                last_error_status: k.last_error_status,
+                status_updated_at: k.status_updated_at,
+                last_recovered_at: k.last_recovered_at,
                 success_count: k.success_count,
                 total_fail_count: k.total_fail_count,
                 rpm_limit: k.rpm_limit,
                 rpd_limit: k.rpd_limit,
+                rpm_limit_source: k.rpm_limit_source.clone(),
+                rpd_limit_source: k.rpd_limit_source.clone(),
                 tpm_limit: k.tpm_limit,
                 tpd_limit: k.tpd_limit,
                 rpm_count: k.rpm_count,
@@ -374,6 +607,70 @@ impl KeyPool {
                 rpd_window_start: k.rpd_window_start,
             })
             .collect()
+    }
+
+    /// Manually restore a key by its stable fingerprint.
+    ///
+    /// This is intended for auth failures (401/403), where automatic recovery is
+    /// deliberately disabled. Historical error timestamps are preserved for audit.
+    pub fn restore_key_by_id(&self, key_id: &str) -> GatewayResult<KeyState> {
+        let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let Some(key) = keys
+            .iter_mut()
+            .find(|key| key_fingerprint(&key.key) == key_id)
+        else {
+            return Err(GatewayError::InvalidRequest(format!(
+                "Key id not found: {key_id}"
+            )));
+        };
+
+        key.status = KeyStatus::Available;
+        key.fail_count = 0;
+        key.cooldown_until = None;
+        key.status_updated_at = Some(now);
+        key.last_recovered_at = Some(now);
+
+        tracing::info!(
+            provider = %self.provider_name,
+            key = %key.masked_key(),
+            key_id = %key_id,
+            stage = "manual_key_restore",
+            "Key manually restored"
+        );
+
+        Ok(KeyState {
+            key: key.masked_key(),
+            key_id: key_id.to_string(),
+            tier: key.tier,
+            models: key.models.clone(),
+            models_updated_at: key.models_updated_at,
+            models_last_error: key.models_last_error.clone(),
+            status: key.status,
+            fail_count: key.fail_count,
+            cooldown_until: key.cooldown_until,
+            last_success_at: key.last_success_at,
+            last_error_at: key.last_error_at,
+            last_error_status: key.last_error_status,
+            status_updated_at: key.status_updated_at,
+            last_recovered_at: key.last_recovered_at,
+            success_count: key.success_count,
+            total_fail_count: key.total_fail_count,
+            rpm_limit: key.rpm_limit,
+            rpd_limit: key.rpd_limit,
+            rpm_limit_source: key.rpm_limit_source.clone(),
+            rpd_limit_source: key.rpd_limit_source.clone(),
+            tpm_limit: key.tpm_limit,
+            tpd_limit: key.tpd_limit,
+            rpm_count: key.rpm_count,
+            rpd_count: key.rpd_count,
+            tpm_prompt_count: key.tpm_prompt_count,
+            tpm_completion_count: key.tpm_completion_count,
+            tpd_prompt_count: key.tpd_prompt_count,
+            tpd_completion_count: key.tpd_completion_count,
+            rpm_window_start: key.rpm_window_start,
+            rpd_window_start: key.rpd_window_start,
+        })
     }
 }
 
@@ -421,10 +718,64 @@ impl KeyHub {
         }
     }
 
+    /// Reserve one request before sending it upstream.
+    pub fn reserve_key(&self, provider_name: &str, key: &str) -> bool {
+        self.pools
+            .get(provider_name)
+            .map(|pool| pool.reserve_key(key))
+            .unwrap_or(false)
+    }
+
+    /// Report success for a provider key whose request was already reserved.
+    pub fn report_reserved_success(
+        &self,
+        provider_name: &str,
+        key: &str,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+    ) {
+        if let Some(pool) = self.pools.get(provider_name) {
+            pool.report_reserved_success(key, prompt_tokens, completion_tokens);
+        }
+    }
+
     /// Report failure for a provider's key.
     pub fn report_failure(&self, provider_name: &str, key: &str, http_status: u16) {
+        self.report_failure_with_retry_after(provider_name, key, http_status, None);
+    }
+
+    /// Report a transient provider/key failure that should not disable auth.
+    pub fn report_transient_failure(&self, provider_name: &str, key: &str, http_status: u16) {
         if let Some(pool) = self.pools.get(provider_name) {
-            pool.report_failure(key, http_status);
+            pool.report_transient_failure(key, http_status);
+        }
+    }
+
+    /// Report failure with optional upstream retry guidance.
+    pub fn report_failure_with_retry_after(
+        &self,
+        provider_name: &str,
+        key: &str,
+        http_status: u16,
+        retry_after_seconds: Option<u64>,
+    ) {
+        if let Some(pool) = self.pools.get(provider_name) {
+            pool.report_failure_with_retry_after(key, http_status, retry_after_seconds);
+        }
+    }
+
+    /// Report a structured upstream error, preserving auth vs WAF/Cloudflare semantics.
+    pub fn report_gateway_error(&self, provider_name: &str, key: &str, error: &GatewayError) {
+        let status = error.http_status();
+        if status == 429 || error.is_auth_failure() {
+            self.report_failure_with_retry_after(
+                provider_name,
+                key,
+                status,
+                error.retry_after_seconds(),
+            );
+        } else {
+            self.report_transient_failure(provider_name, key, status);
         }
     }
 
@@ -433,6 +784,57 @@ impl KeyHub {
         if let Some(pool) = self.pools.get(provider_name) {
             pool.restore_states(states);
         }
+    }
+
+    /// Manually restore a key by provider and key fingerprint.
+    pub fn restore_key(&self, provider_name: &str, key_id: &str) -> GatewayResult<KeyState> {
+        self.pools
+            .get(provider_name)
+            .ok_or_else(|| GatewayError::ProviderNotFound(provider_name.to_string()))?
+            .restore_key_by_id(key_id)
+    }
+
+    /// Return raw key material for a provider for internal rule sync.
+    pub fn provider_keys(&self, provider_name: &str) -> Vec<String> {
+        self.pools
+            .get(provider_name)
+            .map(|pool| pool.keys.read().iter().map(|key| key.key.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Apply discovered request limits for a key without touching config files.
+    pub fn apply_request_limits(
+        &self,
+        provider_name: &str,
+        key: &str,
+        rpm_limit: Option<u32>,
+        rpd_limit: Option<u32>,
+        source: &str,
+    ) -> bool {
+        let Some(pool) = self.pools.get(provider_name) else {
+            return false;
+        };
+        let mut keys = pool.keys.write();
+        let Some(state) = keys.iter_mut().find(|state| state.key == key) else {
+            return false;
+        };
+        if let Some(limit) = rpm_limit {
+            set_request_limit(
+                &mut state.rpm_limit,
+                &mut state.rpm_limit_source,
+                limit,
+                source,
+            );
+        }
+        if let Some(limit) = rpd_limit {
+            set_request_limit(
+                &mut state.rpd_limit,
+                &mut state.rpd_limit_source,
+                limit,
+                source,
+            );
+        }
+        true
     }
 
     /// Get a snapshot of all key pools.
@@ -463,9 +865,14 @@ impl KeyHub {
         self.pools
             .get(provider_name)
             .map(|pool| {
-                pool.keys
-                    .read()
-                    .iter()
+                let now = chrono::Utc::now().timestamp() as u64;
+                let mut keys = pool.keys.write();
+                pool.recover_expired(&mut keys);
+                for key in keys.iter_mut() {
+                    key.reset_rate_windows(now);
+                }
+                keys.iter()
+                    .filter(|key| key.status == KeyStatus::Available && !key.is_rate_limited(now))
                     .map(|key| (key.key.clone(), key.tier))
                     .collect()
             })
@@ -494,7 +901,60 @@ impl KeyHub {
         }
     }
 
-    pub fn free_candidates(&self, provider_name: &str, model: &str, agent_name: Option<&str>) -> Vec<String> {
+    pub fn free_candidates(
+        &self,
+        provider_name: &str,
+        model: &str,
+        agent_name: Option<&str>,
+    ) -> Vec<String> {
+        let mut candidates = self.free_candidate_infos(provider_name, model);
+        match self.routing.strategy {
+            RoutingStrategy::LeastRate => {
+                candidates.sort_by_key(|candidate| candidate.usage_sort_key);
+            }
+            RoutingStrategy::LeastFailed => {
+                candidates.sort_by_key(|candidate| {
+                    (
+                        candidate.fail_count,
+                        candidate.total_fail_count.min(u32::MAX as u64) as u32,
+                    )
+                });
+            }
+            RoutingStrategy::Priority => {}
+            RoutingStrategy::RoundRobin => {
+                if candidates.len() > 1 {
+                    let counter = ROUND_ROBIN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let shift = (counter as usize) % candidates.len();
+                    candidates.rotate_left(shift);
+                }
+            }
+            RoutingStrategy::Random => {
+                if candidates.len() > 1 {
+                    let shift = rand::random::<usize>() % candidates.len();
+                    candidates.rotate_left(shift);
+                }
+            }
+        }
+        let mut result: Vec<String> = candidates
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect();
+
+        // Agent-aware key distribution: rotate the candidate list so
+        // different agents start at different keys. This prevents
+        // Agent A from exhausting a single key and affecting others.
+        if result.len() > 1
+            && let Some(agent) = agent_name.filter(|a| !a.is_empty())
+        {
+            let hash: u32 = agent.bytes().fold(0u32, |a, b| a.wrapping_add(b as u32));
+            let shift = (hash as usize) % result.len();
+            result.rotate_left(shift);
+        }
+
+        result
+    }
+
+    pub fn free_candidate_infos(&self, provider_name: &str, model: &str) -> Vec<FreeKeyCandidate> {
         self.pools
             .get(provider_name)
             .map(|pool| {
@@ -520,30 +980,20 @@ impl KeyHub {
                 for k in keys.iter_mut() {
                     k.reset_rate_windows(now);
                 }
-                let mut candidates: Vec<&KeyState> = keys
-                    .iter()
+                keys.iter()
                     .filter(|key| {
                         key.tier == KeyTier::Free
                             && key.status == KeyStatus::Available
                             && !key.is_rate_limited(now)
                             && key.models.iter().any(|candidate| candidate == model)
                     })
-                    .collect();
-                candidates.sort_by_key(|key| key.fail_count);
-                let mut result: Vec<String> = candidates.into_iter().map(|key| key.key.clone()).collect();
-
-                // Agent-aware key distribution: rotate the candidate list so
-                // different agents start at different keys. This prevents
-                // Agent A from exhausting a single key and affecting others.
-                if result.len() > 1 {
-                    if let Some(agent) = agent_name.filter(|a| !a.is_empty()) {
-                        let hash: u32 = agent.bytes().fold(0u32, |a, b| a.wrapping_add(b as u32));
-                        let shift = (hash as usize) % result.len();
-                        result.rotate_left(shift);
-                    }
-                }
-
-                result
+                    .map(|key| FreeKeyCandidate {
+                        key: key.key.clone(),
+                        usage_sort_key: key_usage_sort_key(key, now),
+                        fail_count: key.fail_count,
+                        total_fail_count: key.total_fail_count,
+                    })
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -584,9 +1034,9 @@ impl KeyHub {
         })
     }
 
-    /// Get any available key (Free or Paid tier) from a provider, ignoring model inventory.
-    /// Used for paid key escalation when all free keys are rate-limited.
-    pub fn any_available_key(&self, provider_name: &str) -> Option<String> {
+    /// Get an available paid key that can serve the requested model.
+    /// Used only for last-resort paid escalation after free keys are exhausted.
+    pub fn paid_candidate_for_model(&self, provider_name: &str, model: &str) -> Option<String> {
         self.pools.get(provider_name).and_then(|pool| {
             // Provider-level cooldown check
             let now = chrono::Utc::now().timestamp() as u64;
@@ -595,7 +1045,7 @@ impl KeyHub {
                 if now < cooldown_until {
                     tracing::debug!(
                         provider = %provider_name,
-                        "Provider in cooldown, any_available_key returns None"
+                        "Provider in cooldown, paid_candidate_for_model returns None"
                     );
                     return None;
                 }
@@ -608,19 +1058,12 @@ impl KeyHub {
             for k in keys.iter_mut() {
                 k.reset_rate_windows(now);
             }
-            // First try paid keys (explicit Paid tier), then fall back to Free
             keys.iter()
                 .find(|k| {
                     k.tier == KeyTier::Paid
                         && k.status == KeyStatus::Available
                         && !k.is_rate_limited(now)
-                })
-                .or_else(|| {
-                    keys.iter().find(|k| {
-                        k.tier == KeyTier::Free
-                            && k.status == KeyStatus::Available
-                            && !k.is_rate_limited(now)
-                    })
+                        && k.models.iter().any(|candidate| candidate == model)
                 })
                 .map(|k| k.key.clone())
         })
@@ -664,14 +1107,11 @@ impl KeyHub {
             for k in keys.iter_mut() {
                 k.reset_rate_windows(now);
             }
-            for key in keys
-                .iter()
-                .filter(|key| {
-                    key.tier == KeyTier::Free
-                        && key.status == KeyStatus::Available
-                        && !key.is_rate_limited(now)
-                })
-            {
+            for key in keys.iter().filter(|key| {
+                key.tier == KeyTier::Free
+                    && key.status == KeyStatus::Available
+                    && !key.is_rate_limited(now)
+            }) {
                 models.extend(
                     key.models
                         .iter()

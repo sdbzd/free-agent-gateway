@@ -1,5 +1,5 @@
 use std::sync::Arc;
-/// Agent Gateway — Main entry point.
+/// free-agent-gateway — Main entry point.
 ///
 /// Single EXE deployment. No Docker, no Kubernetes, no external databases.
 use std::sync::atomic::AtomicU64;
@@ -17,20 +17,22 @@ use std::collections::{HashMap, HashSet};
 
 use parking_lot::RwLock;
 
-use agent_gateway::{
+use free_agent_gateway::{
     AppState,
     api::{
-        self, admin_config_get, admin_config_put, admin_events, admin_index,
-        admin_keys, admin_metadata_errors, admin_metadata_models, admin_metadata_stats,
-        admin_metadata_sync_status, admin_metadata_usage, admin_provider_models_get,
-        admin_provider_models_toggle, admin_provider_refresh, admin_provider_test, admin_save,
-        admin_status, chat_completions, health, list_models, metrics, status,
+        self, admin_config_get, admin_config_put, admin_events, admin_index, admin_keys,
+        admin_metadata_errors, admin_metadata_models, admin_metadata_stats,
+        admin_metadata_sync_status, admin_metadata_usage, admin_provider_key_restore,
+        admin_provider_models_get, admin_provider_models_toggle, admin_provider_refresh,
+        admin_provider_test, admin_save, admin_status, chat_completions, health, list_models,
+        metrics, metrics_prometheus, status,
     },
     config::Config,
     health::HealthRegistry,
     keyhub::KeyHub,
     metadata::{ModelMetaStore, sync::SyncScheduler},
     providers::create_provider,
+    rate_rules::start_openrouter_key_rule_sync,
     router::Router,
     state::PersistedState,
     watcher::Watcher,
@@ -45,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load("config.yaml")?;
     init_tracing(&config.server.log_level);
 
-    tracing::info!("🦀 OpenClaw Gateway v{}", VERSION);
+    tracing::info!("🦀 free-agent-gateway v{}", VERSION);
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // ─── Initialize state ──────────────────────────────────────────
@@ -167,6 +169,9 @@ async fn main() -> anyhow::Result<()> {
         sync_scheduler.start_background_sync();
     }
 
+    let _openrouter_rule_sync =
+        start_openrouter_key_rule_sync(keyhub.clone(), reqwest::Client::new());
+
     // ─── Spawn watcher background task ─────────────────────────────
     let watcher = Arc::new(Watcher::new(
         config.clone(),
@@ -200,9 +205,10 @@ async fn main() -> anyhow::Result<()> {
 
             let mut persisted = PersistedState::new();
             for (provider, keys) in keyhub_snapshot {
-                persisted
-                    .providers
-                    .insert(provider, agent_gateway::state::ProviderKeyState { keys });
+                persisted.providers.insert(
+                    provider,
+                    free_agent_gateway::state::ProviderKeyState { keys },
+                );
             }
 
             // Sync disabled models
@@ -233,15 +239,29 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/metrics", get(metrics))
+        .route("/metrics/prometheus", get(metrics_prometheus))
         .route("/providers", get(api::providers))
         // Admin dashboard & management routes
         .route("/admin", get(admin_index))
         .route("/admin/config", get(admin_config_get).put(admin_config_put))
         .route("/admin/status", get(admin_status))
-        .route("/admin/providers/{name}/refresh", post(admin_provider_refresh))
+        .route(
+            "/admin/providers/{name}/refresh",
+            post(admin_provider_refresh),
+        )
         .route("/admin/providers/{name}/test", post(admin_provider_test))
-        .route("/admin/providers/{name}/models", get(admin_provider_models_get))
-        .route("/admin/providers/{name}/models/{model}/toggle", post(admin_provider_models_toggle))
+        .route(
+            "/admin/providers/{name}/keys/{key_id}/restore",
+            post(admin_provider_key_restore),
+        )
+        .route(
+            "/admin/providers/{name}/models",
+            get(admin_provider_models_get),
+        )
+        .route(
+            "/admin/providers/{name}/models/{model}/toggle",
+            post(admin_provider_models_toggle),
+        )
         .route("/admin/events", get(admin_events))
         .route("/admin/keys", get(admin_keys))
         .route("/admin/save", post(admin_save))
@@ -261,12 +281,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    tracing::info!("🌐 OpenClaw Gateway listening on http://{}", addr);
+    tracing::info!("🌐 free-agent-gateway listening on http://{}", addr);
     tracing::info!("📋 OpenAI-compatible API:  http://{}/v1", addr);
     tracing::info!("🔧 Management API:          http://{}/health", addr);
     tracing::info!("📊 Metrics:                 http://{}/metrics", addr);
     tracing::info!("📋 Admin Dashboard:         http://{}/admin", addr);
-    tracing::info!("🛑 Press Ctrl+C to stop the gateway gracefully", );
+    tracing::info!("🛑 Press Ctrl+C to stop the gateway gracefully",);
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     axum::serve(listener, app)

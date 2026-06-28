@@ -265,7 +265,7 @@ mod tests {
     use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
     use crate::router::Router;
     use crate::state::PersistedState;
-use std::collections::HashSet;
+    use std::collections::HashSet;
 
     #[derive(Debug)]
     struct SlowProvider;

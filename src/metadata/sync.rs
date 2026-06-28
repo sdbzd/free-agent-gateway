@@ -108,12 +108,7 @@ impl SyncScheduler {
             // First seen context_length and max_completion_tokens from top_provider
             let context_window = model
                 .context_length
-                .or_else(|| {
-                    model
-                        .top_provider
-                        .as_ref()
-                        .and_then(|tp| tp.context_length)
-                });
+                .or_else(|| model.top_provider.as_ref().and_then(|tp| tp.context_length));
 
             let max_completion_tokens = model
                 .top_provider

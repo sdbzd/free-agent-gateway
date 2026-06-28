@@ -23,17 +23,24 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> 
             let provider_ref = state.providers.get(&provider_name);
             if let Some(provider) = provider_ref {
                 for (api_key, tier) in state.keyhub.discovery_keys(&provider_name) {
+                    if !state.keyhub.reserve_key(&provider_name, &api_key) {
+                        continue;
+                    }
                     match provider.list_models(&api_key).await {
                         Ok(models) => {
                             state.keyhub.update_models(&provider_name, &api_key, models);
+                            state.keyhub.report_reserved_success(
+                                &provider_name,
+                                &api_key,
+                                None,
+                                None,
+                            );
                         }
                         Err(error) => {
                             let status = error.http_status();
-                            if matches!(status, 401 | 403 | 429) {
-                                state
-                                    .keyhub
-                                    .report_failure(&provider_name, &api_key, status);
-                            }
+                            state
+                                .keyhub
+                                .report_gateway_error(&provider_name, &api_key, &error);
                             state.keyhub.record_model_error(
                                 &provider_name,
                                 &api_key,
@@ -60,22 +67,22 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> 
     let mut model_list = visible_models(&state.config, &state.keyhub, &disabled_map);
 
     // Enrich with metadata from the model knowledge DB if available
-    if let Some(ref meta) = state.model_meta {
-        if let Ok(rows) = meta.list_models(None) {
-            let meta_lookup: HashMap<(String, String), ModelMetaRow> = rows
-                .into_iter()
-                .map(|row| ((row.provider.clone(), row.model_id.clone()), row))
-                .collect();
-            for m in &mut model_list {
-                let provider = m.provider.as_deref().unwrap_or(&m.owned_by);
-                if let Some(row) = meta_lookup.get(&(provider.to_string(), m.id.clone())) {
-                    m.context_window = row.context_window;
-                    m.supports_vision = row.supports_vision;
-                    m.supports_tools = row.supports_tools;
-                    m.supports_reasoning = row.supports_reasoning;
-                    m.pricing_prompt = row.pricing_prompt;
-                    m.pricing_completion = row.pricing_completion;
-                }
+    if let Some(ref meta) = state.model_meta
+        && let Ok(rows) = meta.list_models(None)
+    {
+        let meta_lookup: HashMap<(String, String), ModelMetaRow> = rows
+            .into_iter()
+            .map(|row| ((row.provider.clone(), row.model_id.clone()), row))
+            .collect();
+        for m in &mut model_list {
+            let provider = m.provider.as_deref().unwrap_or(&m.owned_by);
+            if let Some(row) = meta_lookup.get(&(provider.to_string(), m.id.clone())) {
+                m.context_window = row.context_window;
+                m.supports_vision = row.supports_vision;
+                m.supports_tools = row.supports_tools;
+                m.supports_reasoning = row.supports_reasoning;
+                m.pricing_prompt = row.pricing_prompt;
+                m.pricing_completion = row.pricing_completion;
             }
         }
     }
@@ -116,7 +123,9 @@ fn visible_models(
         .collect();
 
     for (alias_name, alias) in &config.models {
-        if let Some((provider, _)) = available.iter().find(|(_, model)| model == &alias.model) {
+        if let Some((provider, _)) = available.iter().find(|(provider, model)| {
+            model == &alias.model && (alias.provider.is_empty() || provider == &alias.provider)
+        }) {
             // Also skip alias if the underlying model is disabled
             let alias_disabled = disabled_models
                 .get(provider)
@@ -140,7 +149,11 @@ fn visible_models(
             });
         }
     }
-    model_list.sort_by(|left, right| left.id.cmp(&right.id).then(left.owned_by.cmp(&right.owned_by)));
+    model_list.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then(left.owned_by.cmp(&right.owned_by))
+    });
     model_list.dedup_by(|left, right| left.id == right.id && left.owned_by == right.owned_by);
     model_list
 }
@@ -223,5 +236,76 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["free-alias", "free-model"]);
+    }
+
+    #[test]
+    fn visible_models_respect_alias_provider() {
+        let config = Config {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 9000,
+                log_level: "info".into(),
+                request_timeout: 30,
+                sse_keepalive: 15,
+            },
+            routing: RoutingConfig {
+                strategy: RoutingStrategy::LeastFailed,
+                fail_threshold: 3,
+                cooldown_seconds: 60,
+                auto_discover: true,
+            },
+            fallback: vec!["first".into(), "second".into()],
+            agents: HashMap::new(),
+            models: HashMap::from([(
+                "second-alias".into(),
+                ModelAlias {
+                    provider: "second".into(),
+                    model: "same-model".into(),
+                },
+            )]),
+            providers: HashMap::from([
+                (
+                    "first".into(),
+                    ProviderConfig {
+                        provider_type: ProviderType::OpenaiCompatible,
+                        enabled: true,
+                        base_url: "http://first.example".into(),
+                        keys: vec![KeyConfig::detailed("first-key", KeyTier::Free)],
+                        health_check_model: String::new(),
+                        timeout_seconds: 5,
+                        priority: 0,
+                    },
+                ),
+                (
+                    "second".into(),
+                    ProviderConfig {
+                        provider_type: ProviderType::OpenaiCompatible,
+                        enabled: true,
+                        base_url: "http://second.example".into(),
+                        keys: vec![KeyConfig::detailed("second-key", KeyTier::Free)],
+                        health_check_model: String::new(),
+                        timeout_seconds: 5,
+                        priority: 0,
+                    },
+                ),
+            ]),
+            watcher: WatcherConfig::default(),
+            state: StateConfig::default(),
+            cors: CorsConfig::default(),
+        };
+        let keyhub = KeyHub::new(config.routing.clone());
+        keyhub.register_provider("first", config.providers["first"].keys.clone());
+        keyhub.register_provider("second", config.providers["second"].keys.clone());
+        keyhub.update_models("first", "first-key", vec!["same-model".into()]);
+        keyhub.update_models("second", "second-key", vec!["same-model".into()]);
+
+        let disabled = HashMap::<String, HashSet<String>>::new();
+        let alias = visible_models(&config, &keyhub, &disabled)
+            .into_iter()
+            .find(|model| model.id == "second-alias")
+            .expect("alias should be visible");
+
+        assert_eq!(alias.owned_by, "second");
+        assert_eq!(alias.provider.as_deref(), Some("second"));
     }
 }

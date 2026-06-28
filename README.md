@@ -1,4 +1,6 @@
-# OpenClaw Gateway
+# free-agent-gateway
+
+Read this in: [中文](README.zh-CN.md) | [English](README.en.md)
 
 ## Safe key-level routing
 
@@ -13,27 +15,42 @@ providers:
     keys:
       - value: "${EXAMPLE_FREE_KEY}"
         tier: free
+        rpm_limit: 20
+        rpd_limit: 200
+        tpm_limit: 20000
+        tpd_limit: 200000
       - value: "${EXAMPLE_PAID_KEY}"
         tier: paid
 ```
 
-The gateway only routes chat requests through available `free` keys that
-advertise the exact requested model. `paid` and `unknown` keys are never used
-automatically. Legacy string keys are treated as `unknown` until migrated.
+Normal routing uses available `free` keys that advertise the exact requested
+model. `paid` keys are reserved for last-resort paid escalation after free keys
+are exhausted or rate-limited. `unknown` keys are never used automatically.
+Legacy string keys are treated as `unknown` until migrated.
 
 `models` aliases and `health_check_model` are optional. Provider fallback never
 changes the requested model.
 
-> OpenClaw 生态统一 AI 入口 — Agent Gateway + KeyHub + Model Router + Health Watcher
+You do not need to know provider-side quotas up front. Set
+`routing.strategy: least_rate` to balance requests across all providers and keys
+by observed daily/minute usage first, then by learned headroom and failure
+pressure. When a key returns 429, the gateway learns an observed RPM/RPD limit
+for that key and keeps other keys from the same provider available.
 
-一个单 EXE 部署的 AI 网关，统一管理 GitHub Models、NVIDIA NIM、OpenCode、Ollama 等多个 Provider，为 OpenClaw、Hermes-Agent、OpenHuman、ZeroClaw、Coding Agent、MCP Agent 提供标准 OpenAI 兼容接口。
+For topped-up keys that should still participate in normal free-model routing,
+keep `tier: free` and set the higher `rpm_limit` / `rpd_limit` if you know it.
+Use `tier: paid` only for last-resort paid escalation.
+
+> OpenClaw / Hermes 当前统一 AI 入口 — free-agent-gateway + KeyHub + Model Router + Health Watcher
+
+一个单 EXE 部署的 AI 网关，统一管理 GitHub Models、NVIDIA NIM、OpenCode、Ollama 等多个 Provider。当前主要服务 OpenClaw 和 Hermes-Agent，后续可扩展到 OpenHuman、ZeroClaw、Coding Agent、MCP Agent 等其他 Agent。
 
 ## 特性
 
 - 🦀 **Rust 编写** — 高性能、内存安全、单文件部署
 - 🔑 **KeyHub** — 每个 Provider 支持多 Key 自动轮换
 - 🔄 **自动故障切换** — 429/5xx/超时自动切换 Provider 和 Key
-- 🧭 **智能路由** — 支持 RoundRobin/Random/LeastFailed/Priority 四种策略
+- 🧭 **智能路由** — 支持 RoundRobin/Random/LeastFailed/LeastRate/Priority 策略
 - 🤖 **Agent 感知** — 根据 Agent 名称自动选择默认模型
 - 📡 **SSE 流式输出** — 完整支持 `stream=true`
 - 🏥 **健康监控** — 后台 Watcher 每 60 秒检查 Provider 健康状态
@@ -52,6 +69,9 @@ changes the requested model.
 | `openai_compatible` | OpenAI 兼容 | 任何兼容 OpenAI API 的服务 |
 | `ollama` | Ollama | 本地 LLM 推理（最终 Fallback） |
 
+OpenRouter、Cerebras、OpenCode 等 OpenAI-compatible 服务都使用
+`type: "openai_compatible"`，只需要配置各自的 `base_url`。
+
 ## 快速开始
 
 ### 编译
@@ -63,7 +83,23 @@ changes the requested model.
 cargo build --release
 ```
 
-编译产物在 `target/release/openclaw-gateway.exe`（Windows）或 `target/release/openclaw-gateway`（Linux）。
+编译产物在 `target/release/free-agent-gateway.exe`（Windows）或 `target/release/free-agent-gateway`（Linux）。
+
+Linux 推荐使用发布脚本，它会构建 release 二进制并打包 `config.yaml.sample`：
+
+```bash
+chmod +x scripts/build-linux.sh
+./scripts/build-linux.sh
+```
+
+产物位置：
+
+```text
+dist/free-agent-gateway-linux-<arch>/free-agent-gateway
+dist/free-agent-gateway-linux-<arch>.tar.gz
+```
+
+GitHub Actions 会在 Ubuntu 上自动生成 `free-agent-gateway-linux-x86_64` artifact。
 
 ### 配置
 
@@ -71,19 +107,19 @@ cargo build --release
 
 ```yaml
 providers:
-  github:
-    type: "github_models"
-    base_url: "https://models.inference.ai.azure.com"
+  cerebras:
+    type: "openai_compatible"
+    enabled: true
+    base_url: "https://api.cerebras.ai/v1"
     keys:
-      - "${GITHUB_TOKEN_1}"
-      - "${GITHUB_TOKEN_2}"
-  nvidia:
-    type: "nvidia"
-    base_url: "https://integrate.api.nvidia.com/v1"
-    keys:
-      - "${NVIDIA_API_KEY_1}"
+      - value: "${CEREBRAS_API_KEY}"
+        tier: free
+        rpm_limit: 30
+        rpd_limit: 1000
+    health_check_model: "llama3.1-8b"
   ollama:
     type: "ollama"
+    enabled: false
     base_url: "http://localhost:11434"
     keys:
       - "ollama"
@@ -93,21 +129,22 @@ providers:
 
 ```bash
 # Windows
-.\openclaw-gateway.exe
+.\free-agent-gateway.exe
 
 # Linux
-./openclaw-gateway
+./free-agent-gateway
 ```
 
 启动后输出：
 
 ```
-🦀 OpenClaw Gateway v0.1.0
+🦀 free-agent-gateway v0.1.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🌐 OpenClaw Gateway listening on http://127.0.0.1:9000
+🌐 free-agent-gateway listening on http://127.0.0.1:9000
 📋 OpenAI-compatible API:  http://127.0.0.1:9000/v1
 🔧 Management API:          http://127.0.0.1:9000/health
 📊 Metrics:                 http://127.0.0.1:9000/metrics
+📈 Prometheus:              http://127.0.0.1:9000/metrics/prometheus
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -123,22 +160,23 @@ providers:
 ```powershell
 # 克隆项目
 git clone <repo-url>
-cd openclaw-gateway
+cd free-agent-gateway
 
 # 编译 Release 版本
 cargo build --release
 
 # 复制产物和配置
-Copy-Item target\release\openclaw-gateway.exe .
+Copy-Item target\release\free-agent-gateway.exe .
 Copy-Item config.yaml .
 
 # 设置环境变量
 $env:GITHUB_TOKEN_1 = "ghp_xxxxxxxxxxxx"
 $env:GITHUB_TOKEN_2 = "ghp_yyyyyyyyyyyy"
 $env:NVIDIA_API_KEY_1 = "nvapi-xxxxxxxxxxxx"
+$env:CEREBRAS_API_KEY = "csk-xxxxxxxxxxxx"
 
 # 启动
-.\openclaw-gateway.exe
+.\free-agent-gateway.exe
 ```
 
 ## Linux 部署
@@ -150,20 +188,25 @@ source $HOME/.cargo/env
 
 # 编译
 git clone <repo-url>
-cd openclaw-gateway
-cargo build --release
+cd free-agent-gateway
+chmod +x scripts/build-linux.sh
+./scripts/build-linux.sh
 
 # 部署
-cp target/release/openclaw-gateway /usr/local/bin/
-cp config.yaml /etc/openclaw-gateway/
+sudo mkdir -p /etc/free-agent-gateway
+sudo cp dist/free-agent-gateway-linux-*/free-agent-gateway /usr/local/bin/
+sudo cp config.yaml.sample /etc/free-agent-gateway/config.yaml
 
 # 设置环境变量
 export GITHUB_TOKEN_1="ghp_xxxxxxxxxxxx"
 export NVIDIA_API_KEY_1="nvapi-xxxxxxxxxxxx"
+export CEREBRAS_API_KEY="csk-xxxxxxxxxxxx"
 
 # 启动
-openclaw-gateway
+free-agent-gateway
 ```
+
+运行后产生的 `config.yaml`、`state.json`、`state.db`、`models.cache`、`*.db`、`dist/` 和日志文件都属于本地运行态数据，不应提交到 Git。
 
 ## OpenClaw 接入
 
@@ -273,12 +316,14 @@ curl http://127.0.0.1:9000/providers
 | GET | `/health` | 健康状态 |
 | GET | `/status` | 网关状态 |
 | GET | `/metrics` | 详细指标 |
+| GET | `/metrics/prometheus` | Prometheus 文本格式指标 |
 | GET | `/providers` | Provider 状态列表 |
 | GET | `/admin` | **Admin Dashboard** — 浏览器内建管理面板 |
 | GET | `/admin/status` | Dashboard 数据 API（Provider/Key 实时状态） |
 | GET | `/admin/providers/:name/models` | 单个 Provider 的模型列表及启用状态 |
 | POST | `/admin/providers/:name/refresh` | 刷新 Provider 模型列表 |
 | POST | `/admin/providers/:name/test` | 测试 Provider 连通性 |
+| POST | `/admin/providers/:name/keys/:key_id/restore` | 手工恢复 401/403 禁用的 Key |
 | POST | `/admin/providers/:name/models/:id/toggle` | 启用/禁用模型 |
 | POST | `/admin/save` | 保存模型配置变更 |
 | GET | `/admin/config` | 当前配置（只读） |

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::error::GatewayResult;
 
@@ -250,11 +250,7 @@ impl ModelMetaStore {
     }
 
     /// Get metadata for a specific provider+model.
-    pub fn get_model(
-        &self,
-        provider: &str,
-        model_id: &str,
-    ) -> GatewayResult<Option<ModelMetaRow>> {
+    pub fn get_model(&self, provider: &str, model_id: &str) -> GatewayResult<Option<ModelMetaRow>> {
         let db = self.db.lock();
         let mut stmt = db.prepare_cached(
             "SELECT id, provider, model_id, display_name, context_window,
@@ -342,15 +338,11 @@ impl ModelMetaStore {
     }
 
     /// Get usage stats for the dashboard.
+    ///
+    /// `days <= 0` returns all known history.
     pub fn get_usage_summary(&self, days: i64) -> GatewayResult<Vec<UsageSummaryRow>> {
         let db = self.db.lock();
-        let cutoff = chrono::Local::now()
-            .checked_sub_signed(chrono::Duration::days(days))
-            .unwrap_or_default()
-            .format("%Y-%m-%d")
-            .to_string();
-
-        let mut stmt = db.prepare_cached(
+        let sql = if days > 0 {
             "SELECT provider, model_id,
                     SUM(request_count) as total_requests,
                     SUM(prompt_tokens) as total_prompt,
@@ -361,10 +353,22 @@ impl ModelMetaStore {
              FROM model_usage
              WHERE date >= ?1
              GROUP BY provider, model_id
-             ORDER BY total_requests DESC",
-        )?;
+             ORDER BY total_requests DESC"
+        } else {
+            "SELECT provider, model_id,
+                    SUM(request_count) as total_requests,
+                    SUM(prompt_tokens) as total_prompt,
+                    SUM(completion_tokens) as total_completion,
+                    SUM(success_count) as total_success,
+                    SUM(error_count) as total_errors,
+                    MAX(last_used_at) as last_used
+             FROM model_usage
+             GROUP BY provider, model_id
+             ORDER BY total_requests DESC"
+        };
+        let mut stmt = db.prepare_cached(sql)?;
 
-        let rows = stmt.query_map(params![cutoff], |row| {
+        let map_row = |row: &rusqlite::Row<'_>| {
             Ok(UsageSummaryRow {
                 provider: row.get(0)?,
                 model_id: row.get(1)?,
@@ -375,12 +379,26 @@ impl ModelMetaStore {
                 total_errors: row.get(6)?,
                 last_used_at: row.get(7)?,
             })
-        })?;
+        };
 
         let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
+        if days > 0 {
+            let cutoff = chrono::Local::now()
+                .checked_sub_signed(chrono::Duration::days(days))
+                .unwrap_or_default()
+                .format("%Y-%m-%d")
+                .to_string();
+            let rows = stmt.query_map(params![cutoff], map_row)?;
+            for row in rows {
+                result.push(row?);
+            }
+        } else {
+            let rows = stmt.query_map([], map_row)?;
+            for row in rows {
+                result.push(row?);
+            }
         }
+
         Ok(result)
     }
 
@@ -425,6 +443,16 @@ impl ModelMetaStore {
         Ok(())
     }
 
+    /// Count learned rate-limit observations.
+    pub fn learned_rate_limit_count(&self) -> GatewayResult<i64> {
+        let db = self.db.lock();
+        Ok(db
+            .query_row("SELECT COUNT(*) FROM rate_limit_learned", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0))
+    }
+
     // ─── Error category tracking ───────────────────────────────────────
 
     /// Classify an error message into a category for tracking.
@@ -435,7 +463,10 @@ impl ModelMetaStore {
             "auth"
         } else if http_status == 404 {
             "not_found"
-        } else if error_msg.contains("timeout") || error_msg.contains("Time out") || http_status == 504 {
+        } else if error_msg.contains("timeout")
+            || error_msg.contains("Time out")
+            || http_status == 504
+        {
             "timeout"
         } else if http_status >= 500 {
             "upstream"
@@ -611,35 +642,41 @@ impl ModelMetaStore {
     /// Get summary statistics for the dashboard.
     pub fn get_stats(&self) -> GatewayResult<MetaStats> {
         let db = self.db.lock();
-        let total_models: i64 = db.query_row(
-            "SELECT COUNT(*) FROM model_meta",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let total_models: i64 = db
+            .query_row("SELECT COUNT(*) FROM model_meta", [], |row| row.get(0))
+            .unwrap_or(0);
 
-        let with_context: i64 = db.query_row(
-            "SELECT COUNT(*) FROM model_meta WHERE context_window IS NOT NULL",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let with_context: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM model_meta WHERE context_window IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
-        let with_vision: i64 = db.query_row(
-            "SELECT COUNT(*) FROM model_meta WHERE supports_vision = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let with_vision: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM model_meta WHERE supports_vision = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
-        let with_pricing: i64 = db.query_row(
-            "SELECT COUNT(*) FROM model_meta WHERE pricing_prompt IS NOT NULL",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let with_pricing: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM model_meta WHERE pricing_prompt IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
-        let synced_count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM sync_state WHERE error_message IS NULL",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let synced_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE error_message IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
         Ok(MetaStats {
             total_models,
@@ -647,11 +684,14 @@ impl ModelMetaStore {
             with_vision,
             with_pricing,
             synced_sources: synced_count,
-            usage_records: db.query_row(
-                "SELECT COUNT(*) FROM model_usage",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
+            usage_records: db
+                .query_row("SELECT COUNT(*) FROM model_usage", [], |row| row.get(0))
+                .unwrap_or(0),
+            learned_rate_limits: db
+                .query_row("SELECT COUNT(*) FROM rate_limit_learned", [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or(0),
         })
     }
 }
@@ -726,4 +766,5 @@ pub struct MetaStats {
     pub with_pricing: i64,
     pub synced_sources: i64,
     pub usage_records: i64,
+    pub learned_rate_limits: i64,
 }

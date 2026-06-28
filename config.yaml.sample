@@ -1,4 +1,4 @@
-# Agent Gateway Configuration
+# free-agent-gateway Configuration
 # ================================
 
 # Server settings
@@ -12,7 +12,7 @@ server:
   # SSE keep-alive interval in seconds
   sse_keepalive: 15
 
-# Routing strategy: round_robin, random, least_failed, priority
+# Routing strategy: round_robin, random, least_failed, least_rate, priority
 routing:
   strategy: "least_failed"
   # Consecutive failure threshold before cooldown
@@ -24,10 +24,13 @@ routing:
 
 # Provider fallback order
 fallback:
-  - "github"
-  - "nvidia"
-  - "opencode"
-  - "ollama"
+- "cerebras"
+- "github"
+- "nvidia"
+- "opencode"
+- "openrouter"
+- "groq"
+- "ollama"
 
 # Model aliases for agents
 agents:
@@ -58,6 +61,9 @@ models:
   reasoning:
     provider: "github"
     model: "openai/o3-mini"
+  fast:
+    provider: "cerebras"
+    model: "llama3.1-8b"
   embedding:
     provider: "nvidia"
     model: "nvidia/nv-embedqa-e5-v5"
@@ -65,14 +71,41 @@ models:
 # Provider configurations
 providers:
 
+  cerebras:
+    type: "openai_compatible"
+    enabled: false
+    base_url: "https://api.cerebras.ai/v1"
+    keys:
+      - value: "${CEREBRAS_API_KEY}"
+        tier: free
+        # Set these if your Cerebras account publishes per-key quotas.
+        # rpm_limit: 30
+        # rpd_limit: 1000
+    health_check_model: "llama3.1-8b"
+    timeout_seconds: 30
+
   openrouter:
     type: "openai_compatible"
-    enabled: true
+    enabled: false
     base_url: "https://openrouter.ai/api/v1"
     # Keys rotate automatically on failure
     keys:
       - value: "<YOUR_API_KEY>"
         tier: free
+        # Optional advanced quotas. Leave these unset if the provider does not
+        # publish per-key limits; routing.strategy: least_rate will still use
+        # observed request volume and failures to spread load.
+        # rpm_limit: 20
+        # rpd_limit: 200
+        # tpm_limit: 20000
+        # tpd_limit: 200000
+      # If any provider key is topped up but you still want it in the normal
+      # free-model pool, keep tier: free and set its higher quota if known.
+      # Use tier: paid only for last-resort paid escalation.
+      # - value: "<TOPPED_UP_PROVIDER_KEY>"
+      #   tier: free
+      #   rpm_limit: 60
+      #   rpd_limit: 1000
       - value: "<YOUR_API_KEY>"
         tier: free
       - value: "<YOUR_API_KEY>"
@@ -101,7 +134,7 @@ providers:
 
   nvidia:
     type: "openai_compatible"
-    enabled: true
+    enabled: false
     base_url: "https://integrate.api.nvidia.com/v1"
     keys:
       - value: "<YOUR_API_KEY>"
@@ -115,19 +148,26 @@ providers:
 
   opencode:
     type: "openai_compatible"
-    enabled: true
+    enabled: false
     base_url: "https://opencode.ai/zen/v1"
     keys:
-      - value: "<YOUR_API_KEY>"
+      - value: "${OPENCODE_API_KEY_1}"
         tier: free
-      - value: "<YOUR_API_KEY>"
+      - value: "${OPENCODE_API_KEY_2}"
         tier: free
-      - value: "<YOUR_API_KEY>"
-        tier: free
-      - value: "<YOUR_API_KEY>"
-        tier: free
-
     health_check_model: "gpt-4o-mini"
+    timeout_seconds: 30
+
+  groq:
+    type: "openai_compatible"
+    enabled: false
+    base_url: "https://api.groq.com/openai/v1"
+    keys:
+      - value: "${GROQ_API_KEY_1}"
+        tier: free
+      - value: "${GROQ_API_KEY_2}"
+        tier: free
+    health_check_model: "llama3-8b-8192"
     timeout_seconds: 30
 
   ollama:

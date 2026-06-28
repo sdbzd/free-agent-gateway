@@ -26,7 +26,12 @@ pub enum GatewayError {
     UpstreamError(String),
 
     #[error("HTTP error {status}: {message}")]
-    HttpError { status: u16, message: String },
+    HttpError {
+        status: u16,
+        message: String,
+        #[allow(dead_code)]
+        retry_after_seconds: Option<u64>,
+    },
 
     #[error("Timeout: {0}")]
     Timeout(String),
@@ -94,7 +99,9 @@ impl IntoResponse for GatewayError {
                 "upstream_error",
                 "Upstream provider request failed".into(),
             ),
-            Self::HttpError { status, message } => (
+            Self::HttpError {
+                status, message, ..
+            } => (
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
                 "http_error",
                 format!("Upstream provider returned HTTP {status}: {message}"),
@@ -145,6 +152,18 @@ impl IntoResponse for GatewayError {
 }
 
 impl GatewayError {
+    pub fn http_error(
+        status: u16,
+        message: impl Into<String>,
+        retry_after_seconds: Option<u64>,
+    ) -> Self {
+        Self::HttpError {
+            status,
+            message: message.into(),
+            retry_after_seconds,
+        }
+    }
+
     pub fn http_status(&self) -> u16 {
         match self {
             Self::HttpError { status, .. } => *status,
@@ -152,6 +171,30 @@ impl GatewayError {
             Self::AuthFailed => 401,
             Self::Timeout(_) => 504,
             _ => 500,
+        }
+    }
+
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::HttpError {
+                retry_after_seconds: Some(seconds),
+                ..
+            } => Some(*seconds),
+            Self::HttpError { message, .. } => parse_retry_after_seconds(message),
+            _ => None,
+        }
+    }
+
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            Self::AuthFailed => true,
+            Self::HttpError { status: 401, .. } => true,
+            Self::HttpError {
+                status: 403,
+                message,
+                ..
+            } => !is_cloudflare_or_waf_block(message),
+            _ => false,
         }
     }
 
@@ -165,6 +208,11 @@ impl GatewayError {
             Self::UpstreamError(_) | Self::Reqwest(_) => "upstream_error",
             Self::HttpError { status: 429, .. } => "rate_limited",
             Self::HttpError { status: 401, .. } => "auth_failed",
+            Self::HttpError {
+                status: 403,
+                message,
+                ..
+            } if is_cloudflare_or_waf_block(message) => "waf_blocked",
             Self::HttpError { status: 403, .. } => "auth_failed",
             Self::HttpError { status: 503, .. } => "upstream_error",
             Self::HttpError { .. } => "upstream_http_error",
@@ -181,8 +229,60 @@ impl GatewayError {
     }
 }
 
+pub fn is_cloudflare_or_waf_block(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("cloudflare")
+        || lower.contains("error code: 1009")
+        || lower.contains("error code 1009")
+        || lower.contains("cf-error")
+        || lower.contains("access denied")
+        || lower.contains("the owner of this website has banned")
+        || lower.contains("waf")
+}
+
 /// Convenient Result alias.
 pub type GatewayResult<T> = Result<T, GatewayError>;
+
+pub fn parse_retry_after_value(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(seconds);
+    }
+
+    let parsed = chrono::DateTime::parse_from_rfc2822(trimmed)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(trimmed))
+        .ok()?;
+    let now = chrono::Utc::now();
+    let seconds = parsed.with_timezone(&chrono::Utc) - now;
+    Some(seconds.num_seconds().max(0) as u64)
+}
+
+pub fn parse_retry_after_seconds(text: &str) -> Option<u64> {
+    let patterns = [
+        r"(?i)(?:retry|try again|reset|available).{0,40}?(\d+)\s*(second|seconds|sec|s|minute|minutes|min|m|hour|hours|hr|h|day|days|d)\b",
+        r"(?i)(\d+)\s*(second|seconds|sec|s|minute|minutes|min|m|hour|hours|hr|h|day|days|d).{0,40}?(?:retry|try again|reset|available)",
+    ];
+
+    for pattern in patterns {
+        let Ok(regex) = regex::Regex::new(pattern) else {
+            continue;
+        };
+        let Some(captures) = regex.captures(text) else {
+            continue;
+        };
+        let amount = captures.get(1)?.as_str().parse::<u64>().ok()?;
+        let unit = captures.get(2)?.as_str().to_ascii_lowercase();
+        return Some(match unit.as_str() {
+            "s" | "sec" | "second" | "seconds" => amount,
+            "m" | "min" | "minute" | "minutes" => amount.saturating_mul(60),
+            "h" | "hr" | "hour" | "hours" => amount.saturating_mul(3600),
+            "d" | "day" | "days" => amount.saturating_mul(86400),
+            _ => continue,
+        });
+    }
+
+    None
+}
 
 pub fn sanitize_diagnostic(message: &str) -> String {
     ["Bearer ", "key=", "token="]
@@ -243,5 +343,25 @@ mod tests {
         assert!(sanitized.contains("Bearer [REDACTED]"));
         assert!(sanitized.contains("key=[REDACTED]"));
         assert!(sanitized.contains("token=[REDACTED]"));
+    }
+
+    #[test]
+    fn cloudflare_403_is_not_auth_failure() {
+        let error = GatewayError::http_error(
+            403,
+            "Access denied | api.groq.com used Cloudflare to restrict access. Error code: 1009",
+            None,
+        );
+
+        assert_eq!(error.category(), "waf_blocked");
+        assert!(!error.is_auth_failure());
+    }
+
+    #[test]
+    fn plain_403_remains_auth_failure() {
+        let error = GatewayError::http_error(403, "invalid api key", None);
+
+        assert_eq!(error.category(), "auth_failed");
+        assert!(error.is_auth_failure());
     }
 }

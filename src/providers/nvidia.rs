@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::config::ProviderConfig;
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
 
@@ -61,11 +61,9 @@ impl Provider for NvidiaProvider {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         let json: serde_json::Value = resp.json().await?;
@@ -99,16 +97,14 @@ impl Provider for NvidiaProvider {
 
         let status = resp.status().as_u16();
         let is_success = resp.status().is_success();
+        let retry_after_seconds = retry_after_seconds(resp.headers());
         let body: serde_json::Value = resp.json().await?;
         if !is_success {
             let msg = body["error"]["message"]
                 .as_str()
                 .unwrap_or(&body.to_string())
                 .to_string();
-            return Err(GatewayError::HttpError {
-                status,
-                message: msg,
-            });
+            return Err(GatewayError::http_error(status, msg, retry_after_seconds));
         }
 
         Ok(ChatResponse { body, status })
@@ -135,11 +131,9 @@ impl Provider for NvidiaProvider {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         let stream = futures::StreamExt::map(resp.bytes_stream(), |item| {
@@ -161,4 +155,11 @@ impl Provider for NvidiaProvider {
 
         Ok(elapsed)
     }
+}
+
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_value)
 }

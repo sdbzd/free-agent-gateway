@@ -9,17 +9,17 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 
-use agent_gateway::config::{
+use free_agent_gateway::config::{
     AgentConfig, Config, KeyConfig, KeyTier, ModelAlias, ProviderConfig, ProviderType,
     RoutingConfig, RoutingStrategy, ServerConfig,
 };
-use agent_gateway::error::{GatewayError, GatewayResult};
-use agent_gateway::keyhub::KeyHub;
-use agent_gateway::models::{ChatCompletionRequest, ChatMessage};
-use agent_gateway::providers::openai_compatible::OpenAiCompatibleProvider;
-use agent_gateway::providers::traits::{ChatResponse, Provider, StreamResponse};
-use agent_gateway::providers::BoxedProvider;
-use agent_gateway::router::{ResolvedRoute, Router};
+use free_agent_gateway::error::{GatewayError, GatewayResult};
+use free_agent_gateway::keyhub::KeyHub;
+use free_agent_gateway::models::{ChatCompletionRequest, ChatMessage};
+use free_agent_gateway::providers::BoxedProvider;
+use free_agent_gateway::providers::openai_compatible::OpenAiCompatibleProvider;
+use free_agent_gateway::providers::traits::{ChatResponse, Provider, StreamResponse};
+use free_agent_gateway::router::{ResolvedRoute, Router};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 
@@ -213,6 +213,7 @@ impl Provider for RecordingProvider {
             return Err(GatewayError::HttpError {
                 status: 503,
                 message: "failed".into(),
+                retry_after_seconds: None,
             });
         }
         Ok(ChatResponse {
@@ -384,6 +385,52 @@ fn test_model_for_fallback_provider_preserves_exact_model() {
     assert_eq!(m, "openai/gpt-4.1-mini");
 }
 
+#[test]
+fn test_resolve_openrouter_free_model_preserves_suffix() {
+    let mut config = make_config();
+    config
+        .fallback
+        .extend(["opencode".into(), "openrouter".into()]);
+    let provider_config = ProviderConfig {
+        provider_type: ProviderType::OpenaiCompatible,
+        enabled: true,
+        base_url: "https://openrouter.ai/api/v1".into(),
+        keys: vec!["or-key".into()],
+        health_check_model: "qwen/qwen3-coder:free".into(),
+        timeout_seconds: 30,
+        priority: 0,
+    };
+    config
+        .providers
+        .insert("openrouter".into(), provider_config.clone());
+
+    let config = Arc::new(config);
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "openrouter".into(),
+        Box::new(OpenAiCompatibleProvider::new(
+            "openrouter",
+            &provider_config,
+        )) as BoxedProvider,
+    );
+    providers.insert(
+        "github".into(),
+        Box::new(OpenAiCompatibleProvider::new("github", &provider_config)) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    let router = build_router(config, providers, keyhub);
+
+    let route = router.resolve("qwen/qwen3-coder:free", None).unwrap();
+    assert_eq!(route.provider_name, "openrouter");
+    assert_eq!(route.model, "qwen/qwen3-coder:free");
+
+    let route = router
+        .resolve("openrouter/qwen/qwen3-coder:free", None)
+        .unwrap();
+    assert_eq!(route.provider_name, "openrouter");
+    assert_eq!(route.model, "qwen/qwen3-coder:free");
+}
+
 #[tokio::test]
 async fn test_non_stream_request_falls_back_and_records_first_failure() {
     let mut first = mockito::Server::new_async().await;
@@ -439,7 +486,7 @@ async fn test_non_stream_request_falls_back_and_records_first_failure() {
         providers.insert(
             name.into(),
             Box::new(OpenAiCompatibleProvider::new(name, provider_config))
-                as agent_gateway::providers::BoxedProvider,
+                as free_agent_gateway::providers::BoxedProvider,
         );
         keyhub.register_provider(name, provider_config.keys.clone());
         keyhub.update_models(name, &format!("{name}-key"), vec!["test-model".into()]);
@@ -478,7 +525,7 @@ async fn test_stream_success_is_recorded_only_after_body_completes() {
         Box::new(TestStreamProvider {
             name: "streamer".into(),
             fail_in_body: false,
-        }) as agent_gateway::providers::BoxedProvider,
+        }) as free_agent_gateway::providers::BoxedProvider,
     );
     let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
     keyhub.register_provider("streamer", vec![tiered_key("stream-key", KeyTier::Free)]);
@@ -517,7 +564,7 @@ async fn test_stream_body_error_records_failure_without_success() {
         Box::new(TestStreamProvider {
             name: "streamer".into(),
             fail_in_body: true,
-        }) as agent_gateway::providers::BoxedProvider,
+        }) as free_agent_gateway::providers::BoxedProvider,
     );
     let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
     keyhub.register_provider("streamer", vec![tiered_key("stream-key", KeyTier::Free)]);
@@ -568,7 +615,7 @@ async fn test_router_never_uses_paid_or_unknown_keys() {
             name: "shared".into(),
             calls: calls.clone(),
             fail_keys: vec![],
-        }) as agent_gateway::providers::BoxedProvider,
+        }) as free_agent_gateway::providers::BoxedProvider,
     );
     let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
     keyhub.register_provider("shared", config.providers["shared"].keys.clone());
@@ -616,7 +663,7 @@ async fn test_router_falls_back_across_free_keys_without_changing_model() {
                 } else {
                     vec![]
                 },
-            }) as agent_gateway::providers::BoxedProvider,
+            }) as free_agent_gateway::providers::BoxedProvider,
         );
     }
     let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
@@ -639,4 +686,113 @@ async fn test_router_falls_back_across_free_keys_without_changing_model() {
             ("second-key".into(), "target-model".into()),
         ]
     );
+}
+
+#[tokio::test]
+async fn test_least_rate_prefers_less_used_key_across_providers() {
+    let mut config = make_config();
+    config.routing.strategy = RoutingStrategy::LeastRate;
+    config.models.clear();
+    config.fallback = vec!["first".into(), "second".into()];
+    config.providers.clear();
+    for name in ["first", "second"] {
+        config.providers.insert(
+            name.into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenaiCompatible,
+                enabled: true,
+                base_url: "http://recording".into(),
+                keys: vec![tiered_key(&format!("{name}-key"), KeyTier::Free)],
+                health_check_model: format!("wrong-{name}"),
+                timeout_seconds: 5,
+                priority: 0,
+            },
+        );
+    }
+    let config = Arc::new(config);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    for name in ["first", "second"] {
+        providers.insert(
+            name.into(),
+            Box::new(RecordingProvider {
+                name: name.into(),
+                calls: calls.clone(),
+                fail_keys: vec![],
+            }) as free_agent_gateway::providers::BoxedProvider,
+        );
+    }
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    for name in ["first", "second"] {
+        keyhub.register_provider(name, config.providers[name].keys.clone());
+        keyhub.update_models(name, &format!("{name}-key"), vec!["target-model".into()]);
+    }
+    keyhub.report_success("first", "first-key", Some(10), Some(5));
+    let router = build_router(config, providers, keyhub);
+
+    router
+        .chat(&chat_request("target-model", false))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![("second-key".into(), "target-model".into())]
+    );
+}
+
+#[tokio::test]
+async fn test_round_robin_rotates_same_model_across_providers() {
+    let mut config = make_config();
+    config.routing.strategy = RoutingStrategy::RoundRobin;
+    config.models.clear();
+    config.fallback = vec!["first".into(), "second".into()];
+    config.providers.clear();
+    for name in ["first", "second"] {
+        config.providers.insert(
+            name.into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenaiCompatible,
+                enabled: true,
+                base_url: "http://recording".into(),
+                keys: vec![tiered_key(&format!("{name}-key"), KeyTier::Free)],
+                health_check_model: format!("wrong-{name}"),
+                timeout_seconds: 5,
+                priority: 0,
+            },
+        );
+    }
+    let config = Arc::new(config);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    for name in ["first", "second"] {
+        providers.insert(
+            name.into(),
+            Box::new(RecordingProvider {
+                name: name.into(),
+                calls: calls.clone(),
+                fail_keys: vec![],
+            }) as free_agent_gateway::providers::BoxedProvider,
+        );
+    }
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    for name in ["first", "second"] {
+        keyhub.register_provider(name, config.providers[name].keys.clone());
+        keyhub.update_models(name, &format!("{name}-key"), vec!["target-model".into()]);
+    }
+    let router = build_router(config, providers, keyhub);
+
+    router
+        .chat(&chat_request("target-model", false))
+        .await
+        .unwrap();
+    router
+        .chat(&chat_request("target-model", false))
+        .await
+        .unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0].0, calls[1].0);
+    assert!(calls.iter().all(|(_, model)| model == "target-model"));
 }

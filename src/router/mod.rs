@@ -7,6 +7,7 @@
 /// - Routing strategies (round-robin, random, least-failed, priority)
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -15,7 +16,7 @@ use parking_lot::RwLock;
 
 use bytes::Bytes;
 
-use crate::config::{Config, KeyTier};
+use crate::config::{Config, KeyTier, RoutingStrategy};
 use crate::error::{GatewayError, GatewayResult, sanitize_diagnostic};
 use crate::keyhub::KeyHub;
 use crate::metadata::ModelMetaStore;
@@ -23,11 +24,42 @@ use crate::models::{ChatCompletionRequest, ChatMessage};
 use crate::providers::BoxedProvider;
 use crate::providers::traits::{ChatResponse, StreamResponse};
 
+static ROUTER_CANDIDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn record_model_usage(
+    model_meta: &Option<ModelMetaStore>,
+    provider: &str,
+    model: &str,
+    success: bool,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+) {
+    if let Some(meta) = model_meta {
+        meta.learn_from_request(
+            provider,
+            model,
+            success,
+            prompt_tokens.map(i64::from),
+            completion_tokens.map(i64::from),
+        );
+    }
+}
+
 /// A resolved route: which provider and model to use.
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
     pub provider_name: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone)]
+struct RouteCandidate {
+    provider: String,
+    key: String,
+    provider_index: usize,
+    usage_sort_key: (u32, u32, u32, u32, u32),
+    fail_count: u32,
+    total_fail_count: u64,
 }
 
 // ─── Context Handoff ─────────────────────────────────────────────────
@@ -118,6 +150,21 @@ fn strip_or_suffixes(model: &str) -> String {
     model.to_string()
 }
 
+fn has_openrouter_suffix(model: &str) -> bool {
+    model
+        .rfind(':')
+        .map(|pos| matches!(&model[pos + 1..], "free" | "paid" | "extended"))
+        .unwrap_or(false)
+}
+
+fn model_for_resolved_provider(provider_name: &str, model: &str) -> String {
+    if provider_name.eq_ignore_ascii_case("openrouter") {
+        model.to_string()
+    } else {
+        strip_or_suffixes(model)
+    }
+}
+
 impl Router {
     /// Create a new router.
     pub fn new(
@@ -194,12 +241,21 @@ impl Router {
             let provider = &model[..slash_pos];
             let model_name = &model[slash_pos + 1..];
             if self.providers.contains_key(provider) {
-                // Also strip suffix from the model_name part
                 return Ok(ResolvedRoute {
                     provider_name: provider.to_string(),
-                    model: strip_or_suffixes(model_name),
+                    model: model_for_resolved_provider(provider, model_name),
                 });
             }
+        }
+
+        // OpenRouter's pricing suffixes are part of the upstream model ID. If
+        // such a model is requested directly, prefer OpenRouter before generic
+        // fallback providers that need bare model names.
+        if has_openrouter_suffix(model) && self.providers.contains_key("openrouter") {
+            return Ok(ResolvedRoute {
+                provider_name: "openrouter".to_string(),
+                model: model.to_string(),
+            });
         }
 
         // 4. Try each fallback provider to see if they can serve this model
@@ -207,7 +263,7 @@ impl Router {
             if self.providers.contains_key(provider_name) {
                 return Ok(ResolvedRoute {
                     provider_name: provider_name.clone(),
-                    model: strip_or_suffixes(model),
+                    model: model_for_resolved_provider(provider_name, model),
                 });
             }
         }
@@ -262,8 +318,12 @@ impl Router {
                 .unwrap_or(false)
         };
 
-        let mut candidates = Vec::new();
-        for provider in self.provider_order(&route.provider_name) {
+        let mut candidates = Vec::<RouteCandidate>::new();
+        for (provider_index, provider) in self
+            .provider_order(&route.provider_name)
+            .into_iter()
+            .enumerate()
+        {
             if model_disabled(&provider) {
                 tracing::debug!(
                     provider = %provider,
@@ -274,12 +334,73 @@ impl Router {
             }
             candidates.extend(
                 self.keyhub
-                    .free_candidates(&provider, &route.model, agent_name)
+                    .free_candidate_infos(&provider, &route.model)
                     .into_iter()
-                    .map(|key| (provider.clone(), key)),
+                    .map(|candidate| RouteCandidate {
+                        provider: provider.clone(),
+                        key: candidate.key,
+                        provider_index,
+                        usage_sort_key: candidate.usage_sort_key,
+                        fail_count: candidate.fail_count,
+                        total_fail_count: candidate.total_fail_count,
+                    }),
             );
         }
+
+        self.order_candidates(candidates, agent_name)
+    }
+
+    fn order_candidates(
+        &self,
+        mut candidates: Vec<RouteCandidate>,
+        agent_name: Option<&str>,
+    ) -> Vec<(String, String)> {
+        match self.config.routing.strategy {
+            RoutingStrategy::LeastRate => {
+                candidates
+                    .sort_by_key(|candidate| (candidate.usage_sort_key, candidate.provider_index));
+            }
+            RoutingStrategy::LeastFailed => {
+                candidates.sort_by_key(|candidate| {
+                    (
+                        candidate.fail_count,
+                        candidate.total_fail_count.min(u32::MAX as u64) as u32,
+                        candidate.provider_index,
+                    )
+                });
+            }
+            RoutingStrategy::Priority => {
+                candidates.sort_by_key(|candidate| candidate.provider_index);
+            }
+            RoutingStrategy::RoundRobin => {
+                if candidates.len() > 1 {
+                    let counter = ROUTER_CANDIDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let shift = (counter as usize) % candidates.len();
+                    candidates.rotate_left(shift);
+                }
+            }
+            RoutingStrategy::Random => {
+                if candidates.len() > 1 {
+                    let shift = rand::random::<usize>() % candidates.len();
+                    candidates.rotate_left(shift);
+                }
+            }
+        }
+
+        if candidates.len() > 1
+            && let Some(agent) = agent_name.filter(|agent| !agent.is_empty())
+        {
+            let hash: u32 = agent
+                .bytes()
+                .fold(0u32, |acc, byte| acc.wrapping_add(byte as u32));
+            let shift = (hash as usize) % candidates.len();
+            candidates.rotate_left(shift);
+        }
+
         candidates
+            .into_iter()
+            .map(|candidate| (candidate.provider, candidate.key))
+            .collect()
     }
 
     async fn refresh_free_models(&self, request_id: &str) {
@@ -312,16 +433,20 @@ impl Router {
                 if tier != KeyTier::Free {
                     continue;
                 }
+                if !self.keyhub.reserve_key(&provider_name, &api_key) {
+                    continue;
+                }
                 match provider.list_models(&api_key).await {
                     Ok(models) => {
                         any_success = true;
                         self.keyhub.update_models(&provider_name, &api_key, models);
+                        self.keyhub
+                            .report_reserved_success(&provider_name, &api_key, None, None);
                     }
                     Err(error) => {
                         let status = error.http_status();
-                        if matches!(status, 401 | 403 | 429) {
-                            self.keyhub.report_failure(&provider_name, &api_key, status);
-                        }
+                        self.keyhub
+                            .report_gateway_error(&provider_name, &api_key, &error);
                         self.keyhub.record_model_error(
                             &provider_name,
                             &api_key,
@@ -380,7 +505,9 @@ impl Router {
         let route = self.resolve(&request.model, request.agent_name.as_deref())?;
         let request_id = request.request_id.as_deref().unwrap_or("unknown");
         let agent_name = request.agent_name.as_deref();
-        let candidates = self.candidates_with_refresh(&route, request_id, agent_name).await;
+        let candidates = self
+            .candidates_with_refresh(&route, request_id, agent_name)
+            .await;
         if candidates.is_empty() {
             let available: Vec<String> = self.providers.iter().map(|p| p.key().clone()).collect();
             let model_summary = self.keyhub.free_model_summary();
@@ -430,18 +557,22 @@ impl Router {
                     continue;
                 }
             };
+            if !self.keyhub.reserve_key(&provider_name, &api_key) {
+                tracing::debug!(
+                    request_id,
+                    provider = %provider_name,
+                    key = %mask_key(&api_key),
+                    "Skipping candidate: key could not be reserved"
+                );
+                continue;
+            }
 
             let mut req = request.clone();
             // Inject context handoff if this is a fallback attempt
-            if attempt_index > 0 {
-                if let Some(ref prev) = last_provider {
-                    req = inject_context_handoff(
-                        req,
-                        prev,
-                        &provider_name,
-                        &route.model,
-                    );
-                }
+            if attempt_index > 0
+                && let Some(ref prev) = last_provider
+            {
+                req = inject_context_handoff(req, prev, &provider_name, &route.model);
             }
             req.model = route.model.clone();
             req.stream = Some(false);
@@ -462,8 +593,20 @@ impl Router {
                 Ok(response) => {
                     let (prompt_tokens, completion_tokens) =
                         crate::models::extract_usage(&response.body);
-                    self.keyhub
-                        .report_success(&provider_name, &api_key, prompt_tokens, completion_tokens);
+                    self.keyhub.report_reserved_success(
+                        &provider_name,
+                        &api_key,
+                        prompt_tokens,
+                        completion_tokens,
+                    );
+                    record_model_usage(
+                        &self.model_meta,
+                        &provider_name,
+                        &route.model,
+                        true,
+                        prompt_tokens,
+                        completion_tokens,
+                    );
                     tracing::info!(
                         request_id,
                         provider = %provider_name,
@@ -481,12 +624,14 @@ impl Router {
                 Err(e) => {
                     let status_code = e.http_status();
                     self.keyhub
-                        .report_failure(&provider_name, &api_key, status_code);
+                        .report_gateway_error(&provider_name, &api_key, &e);
                     // Record failure reason for metadata learning
                     if let Some(ref meta) = self.model_meta {
                         meta.learn_from_failure(
-                            &provider_name, &route.model,
-                            &e.to_string(), status_code,
+                            &provider_name,
+                            &route.model,
+                            &e.to_string(),
+                            status_code,
                         );
                     }
                     last_provider = Some(provider_name.clone());
@@ -518,11 +663,12 @@ impl Router {
         // (transport unreachable, rate-limited, timeout, 5xx), try fallback
         // providers that had NO model-specific candidates in the main list.
         // They might accept the model even if not in their advertised inventory.
-        let is_server_error = matches!(&error,
+        let is_server_error = matches!(
+            &error,
             GatewayError::Reqwest(_)
-            | GatewayError::HttpError { status: 429, .. }
-            | GatewayError::RateLimited
-            | GatewayError::Timeout(_)
+                | GatewayError::HttpError { status: 429, .. }
+                | GatewayError::RateLimited
+                | GatewayError::Timeout(_)
         );
 
         if is_server_error {
@@ -540,6 +686,9 @@ impl Router {
                 let Some(emergency_provider) = self.providers.get(&provider) else {
                     continue;
                 };
+                if !self.keyhub.reserve_key(&provider, &emergency_key) {
+                    continue;
+                }
 
                 let mut req = request.clone();
                 req.model = route.model.clone();
@@ -557,9 +706,19 @@ impl Router {
                     Ok(response) => {
                         let (prompt_tokens, completion_tokens) =
                             crate::models::extract_usage(&response.body);
-                        self.keyhub.report_success(
-                            &provider, &emergency_key,
-                            prompt_tokens, completion_tokens,
+                        self.keyhub.report_reserved_success(
+                            &provider,
+                            &emergency_key,
+                            prompt_tokens,
+                            completion_tokens,
+                        );
+                        record_model_usage(
+                            &self.model_meta,
+                            &provider,
+                            &route.model,
+                            true,
+                            prompt_tokens,
+                            completion_tokens,
                         );
                         tracing::info!(
                             request_id,
@@ -587,15 +746,22 @@ impl Router {
             // ── Round 2: Paid key escalation ────────────────
             // When all free keys from a provider hit 429, try paid keys
             // from the same providers as the last resort.
-            if matches!(&error, GatewayError::HttpError { status: 429, .. } | GatewayError::RateLimited) {
+            if matches!(
+                &error,
+                GatewayError::HttpError { status: 429, .. } | GatewayError::RateLimited
+            ) {
                 for provider in &providers_with_candidates {
-                    let Some(paid_key) = self.keyhub.any_available_key(provider) else {
+                    let Some(paid_key) =
+                        self.keyhub.paid_candidate_for_model(provider, &route.model)
+                    else {
                         continue;
                     };
-                    // Skip if the key is the same tier as what already failed
                     let Some(emergency_provider) = self.providers.get(provider) else {
                         continue;
                     };
+                    if !self.keyhub.reserve_key(provider, &paid_key) {
+                        continue;
+                    }
 
                     let mut req = request.clone();
                     req.model = route.model.clone();
@@ -613,9 +779,19 @@ impl Router {
                         Ok(response) => {
                             let (prompt_tokens, completion_tokens) =
                                 crate::models::extract_usage(&response.body);
-                            self.keyhub.report_success(
-                                provider, &paid_key,
-                                prompt_tokens, completion_tokens,
+                            self.keyhub.report_reserved_success(
+                                provider,
+                                &paid_key,
+                                prompt_tokens,
+                                completion_tokens,
+                            );
+                            record_model_usage(
+                                &self.model_meta,
+                                provider,
+                                &route.model,
+                                true,
+                                prompt_tokens,
+                                completion_tokens,
                             );
                             tracing::info!(
                                 request_id,
@@ -660,7 +836,9 @@ impl Router {
         let route = self.resolve(&request.model, request.agent_name.as_deref())?;
         let request_id = request.request_id.as_deref().unwrap_or("unknown");
         let agent_name = request.agent_name.as_deref();
-        let candidates = self.candidates_with_refresh(&route, request_id, agent_name).await;
+        let candidates = self
+            .candidates_with_refresh(&route, request_id, agent_name)
+            .await;
         if candidates.is_empty() {
             let available: Vec<String> = self.providers.iter().map(|p| p.key().clone()).collect();
             let model_summary = self.keyhub.free_model_summary();
@@ -700,18 +878,22 @@ impl Router {
                 Some(p) => p,
                 None => continue,
             };
+            if !self.keyhub.reserve_key(&provider_name, &api_key) {
+                tracing::debug!(
+                    request_id,
+                    provider = %provider_name,
+                    key = %mask_key(&api_key),
+                    "Skipping stream candidate: key could not be reserved"
+                );
+                continue;
+            }
 
             let mut req = request.clone();
             // Inject context handoff if this is a fallback attempt
-            if attempt_index > 0 {
-                if let Some(ref prev) = last_provider {
-                    req = inject_context_handoff(
-                        req,
-                        prev,
-                        &provider_name,
-                        &route.model,
-                    );
-                }
+            if attempt_index > 0
+                && let Some(ref prev) = last_provider
+            {
+                req = inject_context_handoff(req, prev, &provider_name, &route.model);
             }
             req.model = route.model.clone();
             let upstream_model = req.model.clone();
@@ -744,6 +926,7 @@ impl Router {
                     return Ok(account_stream(
                         response,
                         self.keyhub.clone(),
+                        self.model_meta.clone(),
                         provider_name,
                         api_key,
                         request_id.to_string(),
@@ -753,12 +936,14 @@ impl Router {
                 Err(e) => {
                     let status_code = e.http_status();
                     self.keyhub
-                        .report_failure(&provider_name, &api_key, status_code);
+                        .report_gateway_error(&provider_name, &api_key, &e);
                     // Record failure reason for metadata learning
                     if let Some(ref meta) = self.model_meta {
                         meta.learn_from_failure(
-                            &provider_name, &upstream_model,
-                            &e.to_string(), status_code,
+                            &provider_name,
+                            &upstream_model,
+                            &e.to_string(),
+                            status_code,
                         );
                     }
                     last_provider = Some(provider_name.clone());
@@ -786,11 +971,12 @@ impl Router {
         let error = last_error.unwrap_or(GatewayError::AllProvidersFailed);
 
         // ─── Emergency cross-provider fallback (stream) ────────────
-        let is_server_error = matches!(&error,
+        let is_server_error = matches!(
+            &error,
             GatewayError::Reqwest(_)
-            | GatewayError::HttpError { status: 429, .. }
-            | GatewayError::RateLimited
-            | GatewayError::Timeout(_)
+                | GatewayError::HttpError { status: 429, .. }
+                | GatewayError::RateLimited
+                | GatewayError::Timeout(_)
         );
 
         if is_server_error {
@@ -806,6 +992,9 @@ impl Router {
                 let Some(emergency_provider) = self.providers.get(&provider) else {
                     continue;
                 };
+                if !self.keyhub.reserve_key(&provider, &emergency_key) {
+                    continue;
+                }
 
                 let mut req = request.clone();
                 req.model = route.model.clone();
@@ -831,6 +1020,7 @@ impl Router {
                         return Ok(account_stream(
                             response,
                             self.keyhub.clone(),
+                            self.model_meta.clone(),
                             provider,
                             emergency_key,
                             request_id.to_string(),
@@ -852,14 +1042,22 @@ impl Router {
             }
 
             // ── Round 2: Paid key escalation (stream) ────────
-            if matches!(&error, GatewayError::HttpError { status: 429, .. } | GatewayError::RateLimited) {
+            if matches!(
+                &error,
+                GatewayError::HttpError { status: 429, .. } | GatewayError::RateLimited
+            ) {
                 for provider in &providers_with_candidates {
-                    let Some(paid_key) = self.keyhub.any_available_key(provider) else {
+                    let Some(paid_key) =
+                        self.keyhub.paid_candidate_for_model(provider, &route.model)
+                    else {
                         continue;
                     };
                     let Some(emergency_provider) = self.providers.get(provider) else {
                         continue;
                     };
+                    if !self.keyhub.reserve_key(provider, &paid_key) {
+                        continue;
+                    }
 
                     let mut req = request.clone();
                     req.model = route.model.clone();
@@ -885,6 +1083,7 @@ impl Router {
                             return Ok(account_stream(
                                 response,
                                 self.keyhub.clone(),
+                                self.model_meta.clone(),
                                 provider.clone(),
                                 paid_key,
                                 request_id.to_string(),
@@ -943,6 +1142,7 @@ fn extract_stream_usage(bytes: &Bytes) -> (Option<u32>, Option<u32>) {
 fn account_stream(
     stream: StreamResponse,
     keyhub: Arc<KeyHub>,
+    model_meta: Option<ModelMetaStore>,
     provider_name: String,
     api_key: String,
     request_id: String,
@@ -951,6 +1151,7 @@ fn account_stream(
     struct State {
         stream: StreamResponse,
         keyhub: Arc<KeyHub>,
+        model_meta: Option<ModelMetaStore>,
         provider_name: String,
         api_key: String,
         request_id: String,
@@ -964,6 +1165,7 @@ fn account_stream(
     let state = State {
         stream,
         keyhub,
+        model_meta,
         provider_name,
         api_key,
         request_id,
@@ -984,11 +1186,17 @@ fn account_stream(
                 Some((Ok(bytes), state))
             }
             Some(Err(error)) => {
-                state.keyhub.report_failure(
-                    &state.provider_name,
-                    &state.api_key,
-                    error.http_status(),
-                );
+                state
+                    .keyhub
+                    .report_gateway_error(&state.provider_name, &state.api_key, &error);
+                if let Some(meta) = state.model_meta.as_ref() {
+                    meta.learn_from_failure(
+                        &state.provider_name,
+                        &state.model,
+                        &error.to_string(),
+                        error.http_status(),
+                    );
+                }
                 tracing::error!(
                     request_id = %state.request_id,
                     provider = %state.provider_name,
@@ -1011,7 +1219,7 @@ fn account_stream(
                 let (pt, ct): (Option<u32>, Option<u32>) = state
                     .last_chunk
                     .as_ref()
-                    .map(|bytes| extract_stream_usage(bytes))
+                    .map(extract_stream_usage)
                     .unwrap_or((None, None));
                 if pt.is_some() || ct.is_some() {
                     tracing::debug!(
@@ -1023,9 +1231,14 @@ fn account_stream(
                         "Stream token usage extracted from final chunk"
                     );
                 }
-                state.keyhub.report_success(
+                state
+                    .keyhub
+                    .report_reserved_success(&state.provider_name, &state.api_key, pt, ct);
+                record_model_usage(
+                    &state.model_meta,
                     &state.provider_name,
-                    &state.api_key,
+                    &state.model,
+                    true,
                     pt,
                     ct,
                 );
@@ -1060,7 +1273,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    fn make_router(config: Arc<Config>, providers: Arc<DashMap<String, BoxedProvider>>, keyhub: Arc<KeyHub>) -> Router {
+    fn make_router(
+        config: Arc<Config>,
+        providers: Arc<DashMap<String, BoxedProvider>>,
+        keyhub: Arc<KeyHub>,
+    ) -> Router {
         let disabled_models = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
         Router::new(config, providers, keyhub, disabled_models, None)
     }

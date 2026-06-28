@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::config::ProviderConfig;
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
 
@@ -90,11 +90,9 @@ impl Provider for OllamaProvider {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         let json: serde_json::Value = resp.json().await?;
@@ -134,11 +132,9 @@ impl Provider for OllamaProvider {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         // Convert Ollama response to OpenAI format
@@ -175,11 +171,9 @@ impl Provider for OllamaProvider {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         // Convert Ollama streaming format to OpenAI SSE format
@@ -348,4 +342,11 @@ fn convert_ollama_to_openai(ollama: &serde_json::Value, model: &str) -> serde_js
             "total_tokens": prompt_tokens + completion_tokens,
         }
     })
+}
+
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_value)
 }

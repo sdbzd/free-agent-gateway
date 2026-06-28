@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 use serde::{Deserialize, Serialize};
@@ -368,6 +368,99 @@ fn expand_env_vars(s: &str) -> String {
 }
 
 impl Config {
+    /// Validate cross-field configuration invariants after YAML parsing.
+    pub fn validate(&self) -> GatewayResult<()> {
+        if self.server.port == 0 {
+            return Err(GatewayError::Config(
+                "server.port must be greater than 0".into(),
+            ));
+        }
+        if self.server.request_timeout == 0 {
+            return Err(GatewayError::Config(
+                "server.request_timeout must be greater than 0".into(),
+            ));
+        }
+        if self.server.sse_keepalive == 0 {
+            return Err(GatewayError::Config(
+                "server.sse_keepalive must be greater than 0".into(),
+            ));
+        }
+        if self.providers.is_empty() {
+            return Err(GatewayError::Config(
+                "at least one provider must be configured".into(),
+            ));
+        }
+
+        for provider in &self.fallback {
+            if !self.providers.contains_key(provider) {
+                return Err(GatewayError::Config(format!(
+                    "fallback provider '{provider}' is not configured"
+                )));
+            }
+        }
+
+        for (alias_name, alias) in &self.models {
+            if alias.model.trim().is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "model alias '{alias_name}' must specify a model"
+                )));
+            }
+            if !alias.provider.trim().is_empty() && !self.providers.contains_key(&alias.provider) {
+                return Err(GatewayError::Config(format!(
+                    "model alias '{alias_name}' references unknown provider '{}'",
+                    alias.provider
+                )));
+            }
+        }
+
+        for (agent_name, agent) in &self.agents {
+            if agent.default_model.trim().is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "agent '{agent_name}' must specify default_model"
+                )));
+            }
+        }
+
+        for (name, provider) in &self.providers {
+            if provider.base_url.trim().is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "provider '{name}' must specify base_url"
+                )));
+            }
+            if provider.timeout_seconds == 0 {
+                return Err(GatewayError::Config(format!(
+                    "provider '{name}' timeout_seconds must be greater than 0"
+                )));
+            }
+
+            if !provider.enabled {
+                continue;
+            }
+            if provider.keys.is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "enabled provider '{name}' must configure at least one key"
+                )));
+            }
+
+            let mut seen_keys = HashSet::new();
+            for key in &provider.keys {
+                let value = key.value();
+                if value.trim().is_empty() {
+                    return Err(GatewayError::Config(format!(
+                        "provider '{name}' contains an empty key"
+                    )));
+                }
+                if !seen_keys.insert(value) {
+                    return Err(GatewayError::Config(format!(
+                        "provider '{name}' contains duplicate keys"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Load configuration from a YAML file, expanding environment variables.
     pub fn load(path: &str) -> GatewayResult<Self> {
         let content = std::fs::read_to_string(path)
@@ -375,6 +468,7 @@ impl Config {
         let expanded = expand_env_vars(&content);
         let config: Config = serde_yaml::from_str(&expanded)
             .map_err(|e| GatewayError::Config(format!("YAML parse error: {e}")))?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -383,6 +477,7 @@ impl Config {
         let expanded = expand_env_vars(content);
         let config: Config = serde_yaml::from_str(&expanded)
             .map_err(|e| GatewayError::Config(format!("YAML parse error: {e}")))?;
+        config.validate()?;
         Ok(config)
     }
 }

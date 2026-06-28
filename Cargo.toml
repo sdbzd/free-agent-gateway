@@ -1,8 +1,8 @@
 [package]
-name = "agent-gateway"
+name = "free-agent-gateway"
 version = "0.1.0"
 edition = "2024"
-description = "Agent Gateway - Unified AI entry for the OpenClaw ecosystem"
+description = "Unified OpenAI-compatible gateway for agent workflows"
 license = "MIT"
 readme = "README.md"
 keywords = ["ai", "gateway", "agent", "openai", "proxy"]

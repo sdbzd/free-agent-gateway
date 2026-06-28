@@ -1,9 +1,22 @@
 use async_trait::async_trait;
 
 use crate::config::ProviderConfig;
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
+
+/// Fields that the OpenAI spec does not define and that some OpenAI-compatible
+/// providers (e.g. Cerebras) reject as unsupported parameters.
+const UNSUPPORTED_EXTRA_FIELDS: &[&str] = &["provider"];
+
+/// Remove known unsupported fields from the request's `extra` map before
+/// serializing and sending to the upstream provider. This prevents errors
+/// from strict OpenAI-compatible providers that reject unknown fields.
+fn strip_unsupported_extra_fields(request: &mut ChatCompletionRequest) {
+    for field in UNSUPPORTED_EXTRA_FIELDS {
+        request.extra.remove(*field);
+    }
+}
 
 /// Generic OpenAI-compatible provider.
 ///
@@ -63,11 +76,52 @@ impl Provider for OpenAiCompatibleProvider {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            if matches!(status, 404 | 405)
+                && !self.health_check_model.trim().is_empty()
+                && body.contains("GET not supported")
+            {
+                if let Some(models_url) = cloudflare_models_search_url(&self.base_url) {
+                    match fetch_cloudflare_models(
+                        &client,
+                        &models_url,
+                        api_key,
+                        self.timeout_seconds,
+                    )
+                    .await
+                    {
+                        Ok(models) if !models.is_empty() => {
+                            tracing::info!(
+                                provider = %self.name,
+                                models = models.len(),
+                                "Discovered Cloudflare Workers AI models via models/search"
+                            );
+                            return Ok(models);
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                provider = %self.name,
+                                "Cloudflare models/search returned no models"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                provider = %self.name,
+                                error = %err,
+                                "Cloudflare models/search failed"
+                            );
+                        }
+                    }
+                }
+                tracing::warn!(
+                    provider = %self.name,
+                    status,
+                    "Provider does not support GET /models; using health_check_model as model inventory"
+                );
+                return Ok(vec![self.health_check_model.clone()]);
+            }
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         let json: serde_json::Value = resp.json().await?;
@@ -86,8 +140,9 @@ impl Provider for OpenAiCompatibleProvider {
     async fn chat(
         &self,
         api_key: &str,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> GatewayResult<ChatResponse> {
+        strip_unsupported_extra_fields(&mut request);
         let url = format!("{}/chat/completions", self.base_url);
         let client = reqwest::Client::new();
         let resp = client
@@ -101,6 +156,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let status = resp.status().as_u16();
         let is_success = resp.status().is_success();
+        let retry_after_seconds = retry_after_seconds(resp.headers());
         let body: serde_json::Value = resp.json().await?;
         if !is_success {
             // Extract error message, preferring nested details from OpenRouter-style errors
@@ -109,18 +165,11 @@ impl Provider for OpenAiCompatibleProvider {
                 .and_then(|raw| {
                     serde_json::from_str::<serde_json::Value>(raw)
                         .ok()
-                        .and_then(|v| {
-                            v["error"]["message"].as_str().map(|s| s.to_string())
-                        })
+                        .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
                 })
-                .or_else(|| {
-                    body["error"]["message"].as_str().map(|s| s.to_string())
-                })
+                .or_else(|| body["error"]["message"].as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| body.to_string());
-            return Err(GatewayError::HttpError {
-                status,
-                message: msg,
-            });
+            return Err(GatewayError::http_error(status, msg, retry_after_seconds));
         }
 
         Ok(ChatResponse { body, status })
@@ -129,8 +178,9 @@ impl Provider for OpenAiCompatibleProvider {
     async fn chat_stream(
         &self,
         api_key: &str,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> GatewayResult<StreamResponse> {
+        strip_unsupported_extra_fields(&mut request);
         let mut stream_request = request.clone();
         stream_request.stream = Some(true);
 
@@ -147,11 +197,9 @@ impl Provider for OpenAiCompatibleProvider {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
+            let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
         let stream = futures::StreamExt::map(resp.bytes_stream(), |item| {
@@ -171,4 +219,84 @@ impl Provider for OpenAiCompatibleProvider {
 
         Ok(elapsed)
     }
+}
+
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_value)
+}
+
+fn cloudflare_models_search_url(base_url: &str) -> Option<String> {
+    if !base_url.contains("/client/v4/accounts/") {
+        return None;
+    }
+
+    base_url
+        .strip_suffix("/ai/v1")
+        .map(|prefix| format!("{prefix}/ai/models/search"))
+}
+
+async fn fetch_cloudflare_models(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    timeout_seconds: u64,
+) -> GatewayResult<Vec<String>> {
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .send()
+        .await?;
+
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        let retry_after_seconds = retry_after_seconds(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(GatewayError::http_error(status, body, retry_after_seconds));
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    Ok(extract_cloudflare_model_ids(&json))
+}
+
+fn extract_cloudflare_model_ids(json: &serde_json::Value) -> Vec<String> {
+    let entries = match json["result"]
+        .as_array()
+        .or_else(|| json["data"].as_array())
+    {
+        Some(entries) => entries,
+        None => return Vec::new(),
+    };
+
+    let mut models: Vec<String> = entries
+        .iter()
+        .filter(|m| {
+            m["task"]["name"]
+                .as_str()
+                .is_none_or(|task| task.eq_ignore_ascii_case("Text Generation"))
+        })
+        .filter_map(cloudflare_callable_model_name)
+        .collect();
+
+    if models.is_empty() {
+        models = entries
+            .iter()
+            .filter_map(cloudflare_callable_model_name)
+            .collect();
+    }
+
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn cloudflare_callable_model_name(model: &serde_json::Value) -> Option<String> {
+    ["name", "model", "id"]
+        .iter()
+        .filter_map(|field| model[*field].as_str())
+        .find(|candidate| candidate.starts_with("@cf/"))
+        .map(|candidate| candidate.to_string())
 }

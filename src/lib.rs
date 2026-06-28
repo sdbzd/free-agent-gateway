@@ -1,4 +1,4 @@
-/// Agent Gateway - Unified AI entry for the Agent ecosystem.
+/// free-agent-gateway - Unified AI entry for the Agent ecosystem.
 ///
 /// This is the library root. The binary entry point is in `main.rs`.
 pub mod config;
@@ -10,6 +10,7 @@ pub mod api;
 pub mod health;
 pub mod keyhub;
 pub mod providers;
+pub mod rate_rules;
 pub mod router;
 pub mod state;
 pub mod watcher;

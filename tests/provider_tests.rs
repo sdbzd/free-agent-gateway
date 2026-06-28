@@ -1,10 +1,12 @@
 /// Integration tests for providers.
 ///
 /// Uses mockito to simulate upstream provider responses.
-use agent_gateway::config::{ProviderConfig, ProviderType};
-use agent_gateway::models::{ChatCompletionRequest, ChatMessage};
-use agent_gateway::providers::traits::Provider;
-use agent_gateway::providers::{create_provider, github_models, nvidia, ollama, openai_compatible};
+use free_agent_gateway::config::{ProviderConfig, ProviderType};
+use free_agent_gateway::models::{ChatCompletionRequest, ChatMessage};
+use free_agent_gateway::providers::traits::Provider;
+use free_agent_gateway::providers::{
+    create_provider, github_models, nvidia, ollama, openai_compatible,
+};
 
 fn mock_provider_config(base_url: &str, ptype: ProviderType) -> ProviderConfig {
     ProviderConfig {
@@ -113,11 +115,72 @@ async fn test_openai_compatible_chat() {
 }
 
 #[tokio::test]
+async fn test_openai_compatible_models_405_uses_health_check_model() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/models")
+        .with_status(405)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"success":false,"errors":[{"code":7001,"message":"GET not supported for requested URI."}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let provider = openai_compatible::OpenAiCompatibleProvider::new(
+        "cloudflare",
+        &mock_provider_config(&server.url(), ProviderType::OpenaiCompatible),
+    );
+
+    let models = provider.list_models("test-key").await.unwrap();
+    assert_eq!(models, vec!["test-model".to_string()]);
+}
+
+#[tokio::test]
+async fn test_cloudflare_models_405_uses_models_search() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/client/v4/accounts/test-account/ai/v1/models")
+        .with_status(405)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"success":false,"errors":[{"code":7001,"message":"GET not supported for requested URI."}]}"#,
+        )
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/client/v4/accounts/test-account/ai/models/search")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"success":true,"result":[{"name":"@cf/meta/llama-3.1-8b-instruct"},{"name":"@cf/qwen/qwen3-30b-a3b-fp8"},{"name":"not-a-workers-ai-model"}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let base_url = format!("{}/client/v4/accounts/test-account/ai/v1", server.url());
+    let provider = openai_compatible::OpenAiCompatibleProvider::new(
+        "cloudflare",
+        &mock_provider_config(&base_url, ProviderType::OpenaiCompatible),
+    );
+
+    let models = provider.list_models("test-key").await.unwrap();
+    assert_eq!(
+        models,
+        vec![
+            "@cf/meta/llama-3.1-8b-instruct".to_string(),
+            "@cf/qwen/qwen3-30b-a3b-fp8".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_provider_chat_error_propagation() {
     let mut server = mockito::Server::new_async().await;
     server
         .mock("POST", "/chat/completions")
         .with_status(429)
+        .with_header("Retry-After", "17")
         .with_body(r#"{"error":{"message":"rate limited"}}"#)
         .create_async()
         .await;
@@ -155,9 +218,27 @@ async fn test_provider_chat_error_propagation() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
-        agent_gateway::error::GatewayError::HttpError { status, .. } => assert_eq!(status, 429),
+        free_agent_gateway::error::GatewayError::HttpError {
+            status,
+            retry_after_seconds,
+            ..
+        } => {
+            assert_eq!(status, 429);
+            assert_eq!(retry_after_seconds, Some(17));
+        }
         other => panic!("Expected HttpError, got {other:?}"),
     }
+}
+
+#[test]
+fn test_retry_after_body_fallback_parser() {
+    let error = free_agent_gateway::error::GatewayError::http_error(
+        429,
+        "Rate limit exceeded, try again in 2 minutes",
+        None,
+    );
+
+    assert_eq!(error.retry_after_seconds(), Some(120));
 }
 
 #[tokio::test]

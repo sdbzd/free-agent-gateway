@@ -1,4 +1,4 @@
-/// Data models for the Agent Gateway.
+/// Data models for the free-agent-gateway.
 ///
 /// Includes: OpenAI-compatible request/response types, health state, key state, etc.
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,8 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Internal field set by the gateway for request tracking. Never sent upstream.
+    #[serde(default, skip)]
     pub request_id: Option<String>,
     /// Internal field set by the gateway to track agent context.
     #[serde(skip)]
@@ -84,14 +85,12 @@ pub struct ImageUrl {
 /// Check if a chat message contains image content (vision input).
 pub fn message_has_vision(msg: &ChatMessage) -> bool {
     match &msg.content {
-        serde_json::Value::Array(parts) => {
-            parts.iter().any(|part| {
-                part.get("type")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t == "image_url")
-                    .unwrap_or(false)
-            })
-        }
+        serde_json::Value::Array(parts) => parts.iter().any(|part| {
+            part.get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t == "image_url")
+                .unwrap_or(false)
+        }),
         _ => false,
     }
 }
@@ -251,6 +250,21 @@ pub struct KeyState {
     pub fail_count: u32,
     /// Timestamp (epoch seconds) when cooldown expires. None if not in cooldown.
     pub cooldown_until: Option<u64>,
+    /// Last successful request time (epoch seconds).
+    #[serde(default)]
+    pub last_success_at: Option<u64>,
+    /// Last failed request time (epoch seconds).
+    #[serde(default)]
+    pub last_error_at: Option<u64>,
+    /// HTTP status for the last failed request.
+    #[serde(default)]
+    pub last_error_status: Option<u16>,
+    /// Last time this key's status changed.
+    #[serde(default)]
+    pub status_updated_at: Option<u64>,
+    /// Last time this key automatically recovered from cooldown/rate-limit.
+    #[serde(default)]
+    pub last_recovered_at: Option<u64>,
     /// Total successful requests.
     pub success_count: u64,
     /// Total failed requests.
@@ -263,6 +277,12 @@ pub struct KeyState {
     /// Max requests per day (None = unlimited).
     #[serde(default)]
     pub rpd_limit: Option<u32>,
+    /// Source that last set the RPM limit.
+    #[serde(default)]
+    pub rpm_limit_source: Option<String>,
+    /// Source that last set the RPD limit.
+    #[serde(default)]
+    pub rpd_limit_source: Option<String>,
     /// Max prompt tokens per minute (None = unlimited).
     #[serde(default)]
     pub tpm_limit: Option<u32>,
@@ -378,10 +398,17 @@ impl KeyState {
             status: KeyStatus::Available,
             fail_count: 0,
             cooldown_until: None,
+            last_success_at: None,
+            last_error_at: None,
+            last_error_status: None,
+            status_updated_at: Some(now),
+            last_recovered_at: None,
             success_count: 0,
             total_fail_count: 0,
             rpm_limit: None,
             rpd_limit: None,
+            rpm_limit_source: None,
+            rpd_limit_source: None,
             tpm_limit: None,
             tpd_limit: None,
             rpm_count: 0,
@@ -454,12 +481,27 @@ mod tests {
             "tool_choice": "auto"
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(input).expect("deserialize");
-        assert!(req.extra.contains_key("tools"), "tools should be captured in extra");
-        assert!(req.extra.contains_key("tool_choice"), "tool_choice should be captured in extra");
+        assert!(
+            req.extra.contains_key("tools"),
+            "tools should be captured in extra"
+        );
+        assert!(
+            req.extra.contains_key("tool_choice"),
+            "tool_choice should be captured in extra"
+        );
 
         let output = serde_json::to_value(&req).expect("serialize");
-        assert!(output.get("tools").is_some(), "tools should survive serialization");
-        assert!(output.get("tool_choice").is_some(), "tool_choice should survive serialization");
-        assert!(output.get("tool_choice").and_then(|v| v.as_str()) == Some("auto"), "tool_choice value should be preserved");
+        assert!(
+            output.get("tools").is_some(),
+            "tools should survive serialization"
+        );
+        assert!(
+            output.get("tool_choice").is_some(),
+            "tool_choice should survive serialization"
+        );
+        assert!(
+            output.get("tool_choice").and_then(|v| v.as_str()) == Some("auto"),
+            "tool_choice value should be preserved"
+        );
     }
 }

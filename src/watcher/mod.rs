@@ -66,6 +66,9 @@ impl Watcher {
             let mut last_error = String::new();
 
             for (api_key, tier) in self.keyhub.discovery_keys(&provider_name) {
+                if !self.keyhub.reserve_key(&provider_name, &api_key) {
+                    continue;
+                }
                 let started = std::time::Instant::now();
                 match tokio::time::timeout(check_timeout, provider.list_models(&api_key)).await {
                     Ok(Ok(models)) => {
@@ -73,6 +76,8 @@ impl Watcher {
                         successful_keys += 1;
                         provider_models.extend(models.iter().cloned());
                         self.keyhub.update_models(&provider_name, &api_key, models);
+                        self.keyhub
+                            .report_reserved_success(&provider_name, &api_key, None, None);
                         tracing::debug!(
                             provider = %provider_name,
                             key = %crate::keyhub::key_fingerprint(&api_key),
@@ -82,10 +87,8 @@ impl Watcher {
                         );
                     }
                     Ok(Err(error)) => {
-                        let status = error.http_status();
-                        if matches!(status, 401 | 403 | 429) {
-                            self.keyhub.report_failure(&provider_name, &api_key, status);
-                        }
+                        self.keyhub
+                            .report_gateway_error(&provider_name, &api_key, &error);
                         last_error = error.to_string();
                         self.keyhub.record_model_error(
                             &provider_name,

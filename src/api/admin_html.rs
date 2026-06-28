@@ -13,7 +13,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Free Agent Gateway — Admin</title>
+<title>free-agent-gateway — Admin</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -700,9 +700,38 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
     margin-bottom: 6px;
     font-family: var(--font-mono);
     font-size: 11px;
+  }
+  .key-entry .key-title {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .key-entry .key-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    color: var(--text-dim);
+    font-size: 10px;
+  }
+  .key-entry .key-restore-btn {
+    border: 1px solid var(--success);
+    background: transparent;
+    color: var(--success);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .key-entry .key-restore-btn:hover {
+    background: rgba(0,255,136,0.12);
+  }
+  .key-entry .key-restore-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
   }
   .key-entry .key-status-badge {
     font-size: 10px;
@@ -761,6 +790,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .pill-pct.good { color: var(--success); }
   .pill-pct.mid  { color: var(--warning); }
   .pill-pct.bad  { color: var(--danger); }
+  .pill-pct.neutral { color: var(--text-dim); }
   .key-entry .rate-rows { display: flex; flex-wrap: wrap; gap: 4px 16px; }
   .key-entry .rate-row { display: flex; align-items: center; gap: 6px; min-width: 140px; flex: 1; }
   .key-entry .rate-label { font-size: 10px; color: var(--text-dim); min-width: 28px; font-weight: 600; }
@@ -795,7 +825,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <body>
 <div class="header">
   <div>
-    <h1>🦀 Free Agent Gateway</h1>
+    <h1>🦀 free-agent-gateway</h1>
     <div class="subtitle">v<span id="version">—</span> — <span id="uptime-display">0s</span></div>
   </div>
   <div style="display:flex;align-items:center;gap:12px;">
@@ -808,6 +838,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <div class="tabs">
   <div class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">📊 Dashboard</div>
   <div class="tab" data-tab="models" onclick="switchTab('models')">🗄️ Models</div>
+  <div class="tab" data-tab="usage" onclick="switchTab('usage')">🔤 Usage</div>
   <div class="tab" data-tab="config" onclick="switchTab('config')">⚙️ Config</div>
   <div class="tab" data-tab="logs" onclick="switchTab('logs')">📋 Live Logs</div>
   <div class="tab" data-tab="knowledge" onclick="switchTab('knowledge')">🧠 Knowledge</div>
@@ -840,6 +871,8 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="stat-card"><div class="label">Enabled</div><div class="value green" id="models-enabled">—</div></div>
       <div class="stat-card"><div class="label">Disabled</div><div class="value red" id="models-disabled">—</div></div>
       <div class="stat-card"><div class="label">Providers</div><div class="value" id="models-providers">—</div></div>
+      <div class="stat-card"><div class="label">Requests</div><div class="value" id="models-requests">—</div></div>
+      <div class="stat-card"><div class="label">Tokens</div><div class="value" id="models-tokens">—</div></div>
     </div>
     <div class="model-table-wrap">
       <div class="filter-bar">
@@ -864,6 +897,37 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         </table>
         <div id="model-table-empty" class="empty-state" style="display:none;">Loading models...</div>
       </div>
+    </div>
+  </div>
+
+  <!-- Usage Tab -->
+  <div class="tab-content" id="tab-usage">
+    <div class="stats-bar" id="usage-stats-bar">
+      <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="usage-total-tokens">—</div></div>
+      <div class="stat-card"><div class="label">Prompt Tokens</div><div class="value" id="usage-prompt-tokens">—</div></div>
+      <div class="stat-card"><div class="label">Completion Tokens</div><div class="value" id="usage-completion-tokens">—</div></div>
+      <div class="stat-card"><div class="label">Requests</div><div class="value" id="usage-requests">—</div></div>
+      <div class="stat-card"><div class="label">Success</div><div class="value green" id="usage-success">—</div></div>
+      <div class="stat-card"><div class="label">Errors</div><div class="value red" id="usage-errors">—</div></div>
+    </div>
+    <div style="overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);">
+      <table id="usage-table" style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr>
+            <th>Provider</th>
+            <th>Model</th>
+            <th>Requests</th>
+            <th>Prompt</th>
+            <th>Completion</th>
+            <th>Total Tokens</th>
+            <th>Success</th>
+            <th>Errors</th>
+            <th>Last Used</th>
+          </tr>
+        </thead>
+        <tbody id="usage-table-body"></tbody>
+      </table>
+      <div id="usage-empty" class="empty-state" style="display:none;">No token usage recorded yet</div>
     </div>
   </div>
 
@@ -1024,6 +1088,9 @@ function switchTab(name) {
     loadMetadataModels();
     loadMetadataErrors();
   }
+  if (name === 'usage') {
+    loadUsagePage();
+  }
   if (name === 'chat') {
     populateChatProviders();
     // If no provider selected and we have data, auto-select first
@@ -1118,38 +1185,50 @@ function updateUptime() {
 }
 
 // ─── Rate limit helper ──────────────────────────────
-function rateBar(limit, used, label) {
-  if (!limit) return '';
+function rateBar(limit, used, label, remaining) {
+  used = used || 0;
+  if (!limit) {
+    return `<div class="rate-row">
+      <span class="rate-label">${label}</span>
+      <div class="rate-bar-bg"><div class="rate-bar-fill green" style="width:0%"></div></div>
+      <span class="rate-text">${used}/no limit</span>
+    </div>`;
+  }
   const pct = Math.min(100, Math.round((used / limit) * 100));
   const color = pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green';
+  const remainText = remaining === undefined || remaining === null ? '' : ` · left ${remaining}`;
   return `<div class="rate-row">
     <span class="rate-label">${label}</span>
     <div class="rate-bar-bg"><div class="rate-bar-fill ${color}" style="width:${pct}%"></div></div>
-    <span class="rate-text">${used}/${limit}</span>
+    <span class="rate-text">${used}/${limit}${remainText}</span>
   </div>`;
 }
 
 // ─── Render key details for a provider ──────────────
-function renderKeyDetails(keys) {
+function renderKeyDetails(provider, keys) {
   if (!keys || keys.length === 0) return '';
   return keys.map(k => {
     const st = k.status || 'unknown';
     const statusBadge = `<span class="key-status-badge ${st}">${st}</span>`;
+    const restoreButton = st === 'disabled'
+      ? `<button class="key-restore-btn" onclick="event.stopPropagation();restoreKey('${provider}','${k.key_id}',this)">Restore</button>`
+      : '';
     let cooldownHtml = '';
     if (k.cooldown_until) {
       const recoversAt = new Date(k.cooldown_until * 1000).toLocaleTimeString();
       cooldownHtml = ` <span class="key-cooldown" data-until="${k.cooldown_until}" style="color:var(--warning);font-size:10px;">⏳ cooldown until ${recoversAt} (<span class="cd-timer">…</span>)</span>`;
     }
+    const usage = k.rate_usage && k.rate_usage.axes ? k.rate_usage.axes : {};
     return `<div class="key-entry" data-key="">
       <div class="key-header">
-        <span>🔑 ${k.key} ${statusBadge}${cooldownHtml}</span>
-        <span style="color:var(--text-dim);font-size:10px;">${k.tier || 'unknown'} | ok:${k.success_count} fail:${k.fail_count}</span>
+        <span class="key-title">🔑 ${k.key} ${statusBadge}${cooldownHtml}</span>
+        <span class="key-meta">${restoreButton}<span>${k.tier || 'unknown'} | ok:${k.success_count} fail:${k.fail_count}</span></span>
       </div>
       <div class="rate-rows">
-        ${rateBar(k.rpm_limit, k.rpm_count || 0, 'RPM')}
-        ${rateBar(k.rpd_limit, k.rpd_count || 0, 'RPD')}
-        ${rateBar(k.tpm_limit, k.tpm_total || 0, 'TPM')}
-        ${rateBar(k.tpd_limit, k.tpd_total || 0, 'TPD')}
+        ${rateBar(k.rpm_limit, usage.rpm ? usage.rpm.used : (k.rpm_count || 0), 'RPM', usage.rpm ? usage.rpm.remaining : null)}
+        ${rateBar(k.rpd_limit, usage.rpd ? usage.rpd.used : (k.rpd_count || 0), 'RPD', usage.rpd ? usage.rpd.remaining : null)}
+        ${rateBar(k.tpm_limit, usage.tpm ? usage.tpm.used : (k.tpm_total || 0), 'TPM', usage.tpm ? usage.tpm.remaining : null)}
+        ${rateBar(k.tpd_limit, usage.tpd ? usage.tpd.used : (k.tpd_total || 0), 'TPD', usage.tpd ? usage.tpd.remaining : null)}
       </div>
     </div>`;
   }).join('');
@@ -1178,22 +1257,30 @@ function renderProviders(providers) {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  // helper: compute max usage % across rate axes for a key
-  function keyUsagePct(k) {
-    if (!k) return 0;
+  // helper: summarize key usage. If limits are configured, show percentage;
+  // otherwise show observed request volume instead of a misleading 0%.
+  function keyUsageSummary(k) {
+    if (!k) return { text: '0 req', className: 'neutral' };
     var pcts = [];
     if (k.rpm_limit && k.rpm_limit > 0) pcts.push((k.rpm_count || 0) / k.rpm_limit * 100);
     if (k.rpd_limit && k.rpd_limit > 0) pcts.push((k.rpd_count || 0) / k.rpd_limit * 100);
     if (k.tpm_limit && k.tpm_limit > 0) pcts.push((k.tpm_total || 0) / k.tpm_limit * 100);
     if (k.tpd_limit && k.tpd_limit > 0) pcts.push((k.tpd_total || 0) / k.tpd_limit * 100);
-    return pcts.length ? Math.round(Math.max.apply(null, pcts)) : 0;
+    if (pcts.length) {
+      const pct = Math.round(Math.max.apply(null, pcts));
+      return { text: pct + '%', className: pillPctClass(pct) };
+    }
+    const requests = k.rpd_count || k.rpm_count || 0;
+    const tokens = k.tpd_total || k.tpm_total || 0;
+    if (tokens > 0) return { text: tokens + ' tok', className: 'neutral' };
+    return { text: requests + ' req', className: 'neutral' };
   }
   function pillPctClass(pct) { return pct >= 90 ? 'bad' : pct >= 60 ? 'mid' : 'good'; }
   grid.innerHTML = providers.map(p => {
     const statusClass = p.computed_status || p.status || 'unknown';
     const errorHtml = p.last_error && p.last_error !== 'null'
       ? `<div class="error-text">⚠ ${p.last_error}</div>` : '';
-    const keyDetailsHtml = renderKeyDetails(p.keys);
+    const keyDetailsHtml = renderKeyDetails(p.name, p.keys);
     const toggleName = 'key-toggle-' + p.name.replace(/[^a-zA-Z0-9]/g, '_');
 
     // ─── Per-key overview strip (visible at card level) ─
@@ -1201,13 +1288,12 @@ function renderProviders(providers) {
     const keyStripHtml = keys.length > 0 ? `<div class="key-overview-strip">
       ${keys.map(k => {
         const st = k.status || 'available';
-        const usage = keyUsagePct(k);
-        const pctClass = pillPctClass(usage);
+        const usage = keyUsageSummary(k);
         const label = k.key || '****';
         return `<span class="key-overview-pill" onclick="toggleKeyDetails(document.getElementById('${toggleName}'))" title="Click to expand details">
           <span class="pill-status-dot ${st}"></span>
           <span class="pill-label">${label}</span>
-          <span class="pill-usage"><span class="pill-pct ${pctClass}">${usage}%</span></span>
+          <span class="pill-usage"><span class="pill-pct ${usage.className}">${usage.text}</span></span>
         </span>`;
       }).join('')}
     </div>` : '';
@@ -1366,15 +1452,17 @@ async function renderModels(models) {
           var mid = m.id, eid = encodeURIComponent(mid);
           var rpm = m.rpm_limit, rpd = m.rpd_limit;
           var tpm = m.tpm_limit, tpd = m.tpd_limit;
+          var rpmLeft = m.rpm_unconstrained ? 'unknown' : m.rpm_remaining;
+          var rpdLeft = m.rpd_unconstrained ? 'unknown' : m.rpd_remaining;
           var kc = m.key_count || 0, kh = m.keys_healthy || 0;
-          var hasRates = rpm || rpd || tpm || tpd;
+          var hasRates = rpm || rpd || tpm || tpd || rpmLeft !== null || rpdLeft !== null;
           return '<div class="rich-model-item'+(m.enabled?'':' disabled')+'" data-mid="'+mid.toLowerCase()+'">'+
             '<div class="rm-check"><input type="checkbox" '+(m.enabled?'checked':'')+' onchange="toggleModel(\''+provider+'\',\''+mid.replace(/'/g,"\\'")+'\',this.checked)"></div>'+
             '<div class="rm-id"><span class="mid-text">'+mid+'</span>'+
             '<span class="rm-copy" onclick="copyModelId(\''+mid.replace(/'/g,"\\'")+'\',this)">📋</span></div>'+
             (hasRates ? '<div class="rm-rate-bars">'+
-              (rpm ? '<span class="rrb-label" title="RPM limit">RPM:'+rpm+'</span>' : '')+
-              (rpd ? '<span class="rrb-label" title="RPD limit">RPD:'+rpd+'</span>' : '')+
+              (rpmLeft !== null ? '<span class="rrb-label" title="Current remaining requests per minute">RPM left:'+rpmLeft+'</span>' : (rpm ? '<span class="rrb-label" title="RPM limit">RPM:'+rpm+'</span>' : ''))+
+              (rpdLeft !== null ? '<span class="rrb-label" title="Current remaining requests per day">RPD left:'+rpdLeft+'</span>' : (rpd ? '<span class="rrb-label" title="RPD limit">RPD:'+rpd+'</span>' : ''))+
               (tpm ? '<span class="rrb-label" title="TPM limit">TPM:'+tpm+'</span>' : '')+
               (tpd ? '<span class="rrb-label" title="TPD limit">TPD:'+tpd+'</span>' : '')+
             '</div>' : '')+
@@ -1628,8 +1716,9 @@ function renderModelTable() {
     var va, vb;
     if (col === 0) { va = a.provider; vb = b.provider; }
     else if (col === 1) { va = a.model; vb = b.model; }
-    else if (col === 2) { va = a.status; vb = b.status; }
-    else { va = a.enabled ? 1 : 0; vb = b.enabled ? 1 : 0; }
+    else if (col === 2) { va = a.available ? 1 : 0; vb = b.available ? 1 : 0; }
+    else if (col === 3) { va = a.enabled ? 1 : 0; vb = b.enabled ? 1 : 0; }
+    else { va = a.total_tokens || 0; vb = b.total_tokens || 0; }
     if (va < vb) return asc ? -1 : 1;
     if (va > vb) return asc ? 1 : -1;
     return 0;
@@ -1639,6 +1728,8 @@ function renderModelTable() {
   document.getElementById('models-total').textContent = allCount;
   document.getElementById('models-enabled').textContent = modelTableData.filter(function(d) { return d.enabled; }).length;
   document.getElementById('models-disabled').textContent = modelTableData.filter(function(d) { return !d.enabled; }).length;
+  document.getElementById('models-requests').textContent = formatNum(modelTableData.reduce(function(sum, d) { return sum + (d.total_requests || 0); }, 0));
+  document.getElementById('models-tokens').textContent = formatNum(modelTableData.reduce(function(sum, d) { return sum + (d.total_tokens || 0); }, 0));
   var provSet = {};
   modelTableData.forEach(function(d) { provSet[d.provider] = true; });
   document.getElementById('models-providers').textContent = Object.keys(provSet).length;
@@ -1656,7 +1747,7 @@ function renderModelTable() {
   }
 
   // Headers
-  var headers = ['Provider', 'Model ID', 'Provider Status', 'Enabled'];
+  var headers = ['Provider', 'Model ID', 'Availability', 'Enabled', 'Usage'];
   var headHtml = '<tr>';
   for (var i = 0; i < headers.length; i++) {
     var cls = i === col ? (asc ? 'sort-asc' : 'sort-desc') : '';
@@ -1685,15 +1776,20 @@ function renderModelTable() {
       }
     }
     var safeModel = d.model.replace(/'/g, "\\'");
+    var availability = d.available ? 'available' : (d.unavailable_reason || 'unavailable');
+    var availabilityClass = d.available ? 'green' : 'red';
+    var modelBadge = d.available ? '' : ' <span class="type-badge" style="color:var(--danger);border-color:var(--danger);">不可用</span>';
+    var usageText = formatNum(d.total_tokens || 0) + ' tok · ' + formatNum(d.total_requests || 0) + ' req';
     var toggleBtn = '<button class="toggle-btn ' + (d.enabled ? 'enabled' : 'disabled') + '" onclick="event.stopPropagation();modelTableToggle(\'' + d.provider + '\',\'' + safeModel + '\',this)">' + (d.enabled ? 'Disable' : 'Enable') + '</button>';
     rows += '<tr class="' + (d.enabled ? '' : 'disabled') + '" onclick="toggleModelDetail(this,\'' + d.provider + '\',\'' + safeModel + '\',\'' + provStatus + '\')">' +
       '<td><span class="provider-badge">' + d.provider + '</span></td>' +
-      '<td>' + d.model + '</td>' +
-      '<td>' + provStatus + '</td>' +
+      '<td>' + d.model + modelBadge + '</td>' +
+      '<td><span class="' + availabilityClass + '">' + availability + '</span><span style="color:var(--text-dim);font-size:11px;"> · ' + provStatus + '</span></td>' +
       '<td>' + (d.enabled ? '✅' : '❌') + '</td>' +
+      '<td>' + usageText + '</td>' +
       '<td>' + toggleBtn + '</td>' +
       '</tr>' +
-      '<tr class="detail-row" id="detail-' + i + '"><td colspan="5"><div class="detail-inner" id="detail-inner-' + i + '"></div></td></tr>';
+      '<tr class="detail-row" id="detail-' + i + '"><td colspan="6"><div class="detail-inner" id="detail-inner-' + i + '"></div></td></tr>';
   }
   document.getElementById('model-table-body').innerHTML = rows;
 }
@@ -1724,11 +1820,21 @@ function toggleModelDetail(tr, provider, modelId, provStatus) {
   if (!inner) return;
 
   var safeModel = modelId.replace(/'/g, "\\'");
+  var rpmLeftDetail = md.rpm_unconstrained ? 'unknown' : (md.rpm_remaining ?? '—');
+  var rpdLeftDetail = md.rpd_unconstrained ? 'unknown' : (md.rpd_remaining ?? '—');
+  var quotaDetail = 'RPM left ' + rpmLeftDetail + ' / RPD left ' + rpdLeftDetail;
+  if (md.effective_rpm_limit || md.effective_rpd_limit) {
+    quotaDetail += ' · effective limit RPM ' + (md.effective_rpm_limit || '—') + ' / RPD ' + (md.effective_rpd_limit || '—');
+  }
   inner.innerHTML =
     '<div class="detail-field"><div class="detail-label">Provider</div><div class="detail-value">' + provider + '</div></div>' +
     '<div class="detail-field"><div class="detail-label">Model ID</div><div class="detail-value" style="word-break:break-all;">' + modelId + '</div></div>' +
     '<div class="detail-field"><div class="detail-label">Status</div><div class="detail-value">' + provStatus + '</div></div>' +
+    '<div class="detail-field"><div class="detail-label">Availability</div><div class="detail-value">' + (md.available ? '✅ Available' : '⚠ ' + (md.unavailable_reason || 'Unavailable')) + '</div></div>' +
     '<div class="detail-field"><div class="detail-label">Enabled</div><div class="detail-value">' + (md.enabled ? '✅ Yes' : '❌ No') + '</div></div>' +
+    '<div class="detail-field"><div class="detail-label">Usage</div><div class="detail-value">' + formatNum(md.total_tokens || 0) + ' tokens · ' + formatNum(md.total_requests || 0) + ' requests</div></div>' +
+    '<div class="detail-field"><div class="detail-label">Keys</div><div class="detail-value">' + (md.keys_healthy || 0) + '/' + (md.key_count || 0) + ' available</div></div>' +
+    '<div class="detail-field"><div class="detail-label">Quota</div><div class="detail-value">' + quotaDetail + '</div></div>' +
     '<div class="detail-actions">' +
     '<button class="toggle-btn ' + (md.enabled ? 'enabled' : 'disabled') + '" onclick="event.stopPropagation();modelTableToggle(\'' + provider + '\',\'' + safeModel + '\',this)">' + (md.enabled ? 'Disable' : 'Enable') + '</button>' +
     '</div>';
@@ -1823,11 +1929,38 @@ async function modelTableToggle(provider, modelId, btn) {
 
 async function loadModelTable() {
   try {
-    var data = await apiGet('/v1/models');
-    var models = data.data || [];
-    var provSet = {};
-    models.forEach(function(m) { provSet[m.provider || m.owned_by || 'unknown'] = true; });
-    var providers = Object.keys(provSet);
+    if (!state.status) {
+      try { state.status = await apiGet('/admin/status'); } catch (e) {}
+    }
+    var providers = [];
+    if (state.status && state.status.providers) {
+      providers = state.status.providers.map(function(p) { return p.name; });
+    }
+    if (providers.length === 0) {
+      var publicModels = await apiGet('/v1/models');
+      var provSet = {};
+      (publicModels.data || []).forEach(function(m) { provSet[m.provider || m.owned_by || 'unknown'] = true; });
+      providers = Object.keys(provSet);
+    }
+
+    var usageRows = [];
+    try {
+      var usageData = await apiGet('/admin/metadata/usage');
+      usageRows = usageData.usage || [];
+    } catch (e) {}
+    var usageMap = {};
+    usageRows.forEach(function(u) {
+      usageMap[(u.provider || '') + '|' + (u.model_id || '')] = {
+        total_requests: u.total_requests || 0,
+        total_prompt_tokens: u.total_prompt_tokens || 0,
+        total_completion_tokens: u.total_completion_tokens || 0,
+        total_tokens: (u.total_prompt_tokens || 0) + (u.total_completion_tokens || 0),
+        total_success: u.total_success || 0,
+        total_errors: u.total_errors || 0,
+        last_used_at: u.last_used_at || null
+      };
+    });
+
     var perProv = {};
     for (var i = 0; i < providers.length; i++) {
       try {
@@ -1835,14 +1968,36 @@ async function loadModelTable() {
         perProv[providers[i]] = pd.models || [];
       } catch(e) { perProv[providers[i]] = null; }
     }
-    modelTableData = models.map(function(m) {
-      var prov = m.provider || m.owned_by || 'unknown';
-      var pm = perProv[prov];
-      if (pm) {
-        var found = pm.filter(function(pm_) { return pm_.id === m.id; });
-        return { provider: prov, model: m.id, enabled: found.length > 0 ? found[0].enabled : true };
-      }
-      return { provider: prov, model: m.id, enabled: true };
+    modelTableData = [];
+    providers.forEach(function(prov) {
+      var models = perProv[prov] || [];
+      models.forEach(function(m) {
+        var usage = usageMap[prov + '|' + m.id] || {};
+        modelTableData.push({
+          provider: prov,
+          model: m.id,
+          enabled: m.enabled !== false,
+          available: m.available === true,
+          unavailable_reason: m.unavailable_reason || null,
+          key_count: m.key_count || 0,
+          keys_healthy: m.keys_healthy || 0,
+          rpm_limit: m.rpm_limit || null,
+          rpd_limit: m.rpd_limit || null,
+          effective_rpm_limit: m.effective_rpm_limit || null,
+          effective_rpd_limit: m.effective_rpd_limit || null,
+          rpm_remaining: m.rpm_remaining,
+          rpd_remaining: m.rpd_remaining,
+          rpm_unconstrained: m.rpm_unconstrained === true,
+          rpd_unconstrained: m.rpd_unconstrained === true,
+          total_requests: usage.total_requests || 0,
+          total_prompt_tokens: usage.total_prompt_tokens || 0,
+          total_completion_tokens: usage.total_completion_tokens || 0,
+          total_tokens: usage.total_tokens || 0,
+          total_success: usage.total_success || 0,
+          total_errors: usage.total_errors || 0,
+          last_used_at: usage.last_used_at || null
+        });
+      });
     });
     // Init filter state: all providers checked
     modelFilterState.providers = {};
@@ -1932,6 +2087,29 @@ async function enableAllModels(provider) {
     if (state.models) renderModels(state.models);
   } catch (e) {
     showToast(`Failed: ${e.message}`, 'error');
+  }
+}
+
+async function restoreKey(provider, keyId, btn) {
+  if (!keyId) {
+    showToast('Missing key id', 'error');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Restoring...';
+  }
+  try {
+    const result = await apiPost(`/admin/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(keyId)}/restore`);
+    if (!result.success) throw new Error(result.error || 'restore failed');
+    showToast(`${provider}: key restored`, 'success');
+    await loadDashboard();
+  } catch (e) {
+    showToast(`Restore failed: ${e.message}`, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Restore';
+    }
   }
 }
 
@@ -2133,6 +2311,55 @@ async function loadMetadataStats() {
     document.getElementById('meta-err-other').textContent = cats.other || 0;
   } catch (e) {
     document.getElementById('meta-total').textContent = 'Error';
+  }
+}
+
+async function loadUsagePage() {
+  try {
+    var data = await apiGet('/admin/metadata/usage');
+    var summary = data.summary || {};
+    document.getElementById('usage-total-tokens').textContent = formatNum(summary.total_tokens || 0);
+    document.getElementById('usage-prompt-tokens').textContent = formatNum(summary.total_prompt_tokens || 0);
+    document.getElementById('usage-completion-tokens').textContent = formatNum(summary.total_completion_tokens || 0);
+    document.getElementById('usage-requests').textContent = formatNum(summary.total_requests || 0);
+    document.getElementById('usage-success').textContent = formatNum(summary.total_success || 0);
+    document.getElementById('usage-errors').textContent = formatNum(summary.total_errors || 0);
+
+    var rows = data.usage || [];
+    var body = document.getElementById('usage-table-body');
+    var empty = document.getElementById('usage-empty');
+    if (!rows.length) {
+      body.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    rows = rows.slice().sort(function(a, b) {
+      var at = (a.total_prompt_tokens || 0) + (a.total_completion_tokens || 0);
+      var bt = (b.total_prompt_tokens || 0) + (b.total_completion_tokens || 0);
+      if (bt !== at) return bt - at;
+      return (b.total_requests || 0) - (a.total_requests || 0);
+    });
+    body.innerHTML = rows.map(function(u) {
+      var prompt = u.total_prompt_tokens || 0;
+      var completion = u.total_completion_tokens || 0;
+      var total = prompt + completion;
+      var last = u.last_used_at ? new Date(u.last_used_at * 1000).toLocaleString() : '—';
+      return '<tr>' +
+        '<td><span class="provider-badge">' + (u.provider || 'unknown') + '</span></td>' +
+        '<td style="word-break:break-all;">' + (u.model_id || '') + '</td>' +
+        '<td>' + formatNum(u.total_requests || 0) + '</td>' +
+        '<td>' + formatNum(prompt) + '</td>' +
+        '<td>' + formatNum(completion) + '</td>' +
+        '<td><strong>' + formatNum(total) + '</strong></td>' +
+        '<td class="green">' + formatNum(u.total_success || 0) + '</td>' +
+        '<td class="' + ((u.total_errors || 0) > 0 ? 'red' : '') + '">' + formatNum(u.total_errors || 0) + '</td>' +
+        '<td style="color:var(--text-dim);">' + last + '</td>' +
+      '</tr>';
+    }).join('');
+  } catch (e) {
+    document.getElementById('usage-empty').style.display = 'block';
+    document.getElementById('usage-empty').textContent = 'Failed to load usage: ' + e.message;
   }
 }
 
@@ -2432,6 +2659,7 @@ async function refreshAll() {
       loadMetadataSyncStatus(),
       loadMetadataModels(),
       loadMetadataErrors(),
+      loadUsagePage(),
     ]);
     showToast('All data refreshed', 'success');
   } catch (e) {
@@ -2466,6 +2694,7 @@ schedulePoll();
 setInterval(loadModels, 120000);
 setInterval(loadMetadataStats, 120000);
 setInterval(loadMetadataErrors, 120000);
+setInterval(loadUsagePage, 120000);
 setInterval(updateUptime, 1000);
 setInterval(updateCooldownTimers, 1000);
 </script>

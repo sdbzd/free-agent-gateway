@@ -1,11 +1,11 @@
 /// Integration tests for config parsing, state persistence, and health registry.
-use agent_gateway::config::{
+use free_agent_gateway::config::{
     Config, KeyConfig, KeyTier, ProviderConfig, ProviderType, RoutingStrategy,
 };
-use agent_gateway::health::HealthRegistry;
-use agent_gateway::keyhub::{KeyHub, key_fingerprint};
-use agent_gateway::models::{KeyState, KeyStatus};
-use agent_gateway::state::PersistedState;
+use free_agent_gateway::health::HealthRegistry;
+use free_agent_gateway::keyhub::{KeyHub, key_fingerprint};
+use free_agent_gateway::models::{KeyState, KeyStatus};
+use free_agent_gateway::state::PersistedState;
 
 const SAMPLE_CONFIG: &str = r#"
 server:
@@ -43,6 +43,14 @@ providers:
       - "gh-key"
     health_check_model: "openai/gpt-4.1-mini"
     timeout_seconds: 30
+  nvidia:
+    type: "nvidia"
+    enabled: true
+    base_url: "https://integrate.api.nvidia.com/v1"
+    keys:
+      - "nv-key"
+    health_check_model: "meta/llama-3.1-70b-instruct"
+    timeout_seconds: 30
   ollama:
     type: "ollama"
     enabled: true
@@ -67,6 +75,19 @@ fn test_config_parse_from_yaml() {
         config.fallback,
         vec!["nvidia".to_string(), "ollama".to_string()]
     );
+}
+
+#[test]
+fn test_sample_config_parses_and_validates() {
+    let yaml = std::fs::read_to_string("config.yaml.sample").unwrap();
+    let config = Config::from_str_yaml(&yaml).unwrap();
+
+    config.validate().unwrap();
+    assert_eq!(
+        config.providers["cerebras"].provider_type,
+        ProviderType::OpenaiCompatible
+    );
+    assert!(!config.providers["cerebras"].enabled);
 }
 
 #[test]
@@ -135,6 +156,90 @@ providers:
 }
 
 #[test]
+fn test_config_validation_rejects_unknown_fallback_provider() {
+    let yaml = r#"
+server: {}
+routing: {}
+fallback:
+  - missing
+providers:
+  test:
+    type: openai_compatible
+    base_url: https://example.test/v1
+    keys:
+      - test-key
+"#;
+
+    let error = Config::from_str_yaml(yaml).unwrap_err();
+
+    assert!(error.to_string().contains("fallback provider 'missing'"));
+}
+
+#[test]
+fn test_config_validation_rejects_empty_provider_key() {
+    let yaml = r#"
+server: {}
+routing: {}
+providers:
+  test:
+    type: openai_compatible
+    base_url: https://example.test/v1
+    keys:
+      - ""
+"#;
+
+    let error = Config::from_str_yaml(yaml).unwrap_err();
+
+    assert!(error.to_string().contains("contains an empty key"));
+}
+
+#[test]
+fn test_config_validation_allows_empty_keys_on_disabled_provider() {
+    let yaml = r#"
+server: {}
+routing: {}
+providers:
+  disabled:
+    type: openai_compatible
+    enabled: false
+    base_url: https://example.test/v1
+    keys:
+      - ""
+  active:
+    type: openai_compatible
+    base_url: https://example.test/v1
+    keys:
+      - active-key
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+
+    assert!(!config.providers["disabled"].enabled);
+}
+
+#[test]
+fn test_config_validation_rejects_alias_with_unknown_provider() {
+    let yaml = r#"
+server: {}
+routing: {}
+models:
+  chat:
+    provider: missing
+    model: gpt-test
+providers:
+  test:
+    type: openai_compatible
+    base_url: https://example.test/v1
+    keys:
+      - test-key
+"#;
+
+    let error = Config::from_str_yaml(yaml).unwrap_err();
+
+    assert!(error.to_string().contains("references unknown provider"));
+}
+
+#[test]
 fn test_state_save_and_load_roundtrip() {
     let temp_dir = std::env::temp_dir();
     let path = temp_dir.join("openclaw_test_state.json");
@@ -146,8 +251,8 @@ fn test_state_save_and_load_roundtrip() {
     let mut state = PersistedState::new();
     state.providers.insert(
         "github".into(),
-        agent_gateway::state::ProviderKeyState {
-            keys: vec![agent_gateway::models::KeyState::new("test-key".into())],
+        free_agent_gateway::state::ProviderKeyState {
+            keys: vec![free_agent_gateway::models::KeyState::new("test-key".into())],
         },
     );
 
@@ -274,7 +379,7 @@ fn test_state_serializes_key_identifier_without_raw_key() {
     let path_str = path.to_str().unwrap();
     let _ = std::fs::remove_file(path_str);
 
-    let hub = KeyHub::new(agent_gateway::config::RoutingConfig {
+    let hub = KeyHub::new(free_agent_gateway::config::RoutingConfig {
         strategy: RoutingStrategy::LeastFailed,
         fail_threshold: 3,
         cooldown_seconds: 60,
@@ -285,9 +390,10 @@ fn test_state_serializes_key_identifier_without_raw_key() {
 
     let mut state = PersistedState::new();
     for (provider, keys) in hub.snapshot() {
-        state
-            .providers
-            .insert(provider, agent_gateway::state::ProviderKeyState { keys });
+        state.providers.insert(
+            provider,
+            free_agent_gateway::state::ProviderKeyState { keys },
+        );
     }
     state.save(path_str).unwrap();
 
@@ -300,7 +406,7 @@ fn test_state_serializes_key_identifier_without_raw_key() {
 
 #[test]
 fn test_persisted_state_restores_only_matching_configured_keys() {
-    let routing = agent_gateway::config::RoutingConfig {
+    let routing = free_agent_gateway::config::RoutingConfig {
         strategy: RoutingStrategy::LeastFailed,
         fail_threshold: 3,
         cooldown_seconds: 60,

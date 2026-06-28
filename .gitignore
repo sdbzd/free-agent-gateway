@@ -1,5 +1,17 @@
 # Rust build output
 /target
+target-codex-check/
+target-codex-verify/
+target-codex-verify2/
+target-codex-verify3/
+target-codex-verify4/
+target-codex-verify5/
+target-codex-verify6/
+target-codex-verify7/
+target-codex-verify8/
+target-codex-verify9/
+target-codex-release/
+target-*/
 
 # Runtime state files (generated at startup)
 state.json
@@ -30,15 +42,34 @@ config.yaml
 *.json
 !config.yaml.sample
 state.db
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
 *.err
 gateway.log
 
 # Dev / temp scripts
 _apply_patch.ps1
 prompt.md
+.local-monitor/
+.local-docs/
 
 # Compiled binary
 /bin/
+dist/
+*.tar.gz
 
 # OMO session data
 .omo/
+
+*.py
+*.json

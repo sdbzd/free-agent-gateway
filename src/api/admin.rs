@@ -1,17 +1,17 @@
 /// Admin endpoints: configuration management, provider testing, SSE events.
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::{
-        sse::{Event, Sse},
         Json,
+        sse::{Event, Sse},
     },
 };
 use futures::stream::Stream;
 use serde_json::json;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
 
@@ -106,30 +106,27 @@ pub async fn admin_config_put(
                 }
 
                 // Re-register provider if needed
-                if new_config.enabled != pc.enabled || new_config.base_url != pc.base_url {
-                    if let Ok(provider) =
-                        crate::providers::create_provider(name, &new_config)
-                    {
-                        state.providers.insert(name.clone(), provider);
-                        state
-                            .keyhub
-                            .register_provider(name, new_config.keys.clone());
-                    }
+                if (new_config.enabled != pc.enabled || new_config.base_url != pc.base_url)
+                    && let Ok(provider) = crate::providers::create_provider(name, &new_config)
+                {
+                    state.providers.insert(name.clone(), provider);
+                    state
+                        .keyhub
+                        .register_provider(name, new_config.keys.clone());
                 }
 
-                // Update in-memory config (use unsafe to mutate Arc'd config)
-                // Instead, we recreate config with updated providers
-                let mut providers_map = state.config.providers.clone();
-                providers_map.insert(name.clone(), new_config.clone());
-                // Note: We don't persist this to disk yet. Config reload requires restart.
-                // We update the provider in the providers map for runtime behavior.
+                // Config is immutable after startup; this endpoint applies runtime
+                // provider/key changes only. Persist durable config changes in config.yaml.
 
                 // Broadcast config update event
-                let _ = state.sse_tx.send(json!({
-                    "type": "config_update",
-                    "data": { "provider": name, "enabled": new_config.enabled },
-                    "timestamp": chrono::Utc::now().timestamp(),
-                }).to_string());
+                let _ = state.sse_tx.send(
+                    json!({
+                        "type": "config_update",
+                        "data": { "provider": name, "enabled": new_config.enabled },
+                        "timestamp": chrono::Utc::now().timestamp(),
+                    })
+                    .to_string(),
+                );
             }
         }
     }
@@ -142,8 +139,12 @@ pub async fn admin_config_put(
 pub async fn admin_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let health_states = state.health_registry.snapshot();
     let uptime = state.start_time.elapsed().as_secs();
-    let total_requests = state.request_counter.load(std::sync::atomic::Ordering::Relaxed);
-    let total_errors = state.error_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let total_requests = state
+        .request_counter
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let total_errors = state
+        .error_counter
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Build a lookup: provider_name -> key snapshots (real-time from keyhub)
     let key_snapshots: std::collections::HashMap<String, Vec<crate::models::KeyState>> = state
@@ -155,10 +156,14 @@ pub async fn admin_status(State(state): State<AppState>) -> Json<serde_json::Val
 
     // Build real-time available key count from keyhub snapshot
     use crate::models::KeyStatus;
+    let now_secs = chrono::Utc::now().timestamp() as u64;
     let real_available: std::collections::HashMap<String, usize> = key_snapshots
         .iter()
         .map(|(name, keys)| {
-            let avail = keys.iter().filter(|k| k.status == KeyStatus::Available).count();
+            let avail = keys
+                .iter()
+                .filter(|k| k.status == KeyStatus::Available && !k.is_rate_limited(now_secs))
+                .count();
             (name.clone(), avail)
         })
         .collect();
@@ -178,12 +183,30 @@ pub async fn admin_status(State(state): State<AppState>) -> Json<serde_json::Val
         // Compute live status: health_registry knows about provider reachability,
         // keyhub knows about real-time key availability.
         let computed_status = match hs.status.as_str() {
-            "unhealthy" => { unhealthy += 1; "unhealthy" }
-            "disabled"  => { unhealthy += 1; "disabled" }
-            _ if real_available_keys == 0 && total_keys > 0 => { exhausted += 1; "exhausted" }
-            _ if real_available_keys > 0 && real_available_keys < total_keys => { degraded += 1; "degraded" }
-            _ if real_available_keys > 0 => { healthy += 1; "healthy" }
-            _ => { healthy += 1; &hs.status }
+            "unhealthy" => {
+                unhealthy += 1;
+                "unhealthy"
+            }
+            "disabled" => {
+                unhealthy += 1;
+                "disabled"
+            }
+            _ if real_available_keys == 0 && total_keys > 0 => {
+                exhausted += 1;
+                "exhausted"
+            }
+            _ if real_available_keys > 0 && real_available_keys < total_keys => {
+                degraded += 1;
+                "degraded"
+            }
+            _ if real_available_keys > 0 => {
+                healthy += 1;
+                "healthy"
+            }
+            _ => {
+                healthy += 1;
+                &hs.status
+            }
         };
 
         providers_detail.push(json!({
@@ -208,14 +231,22 @@ pub async fn admin_status(State(state): State<AppState>) -> Json<serde_json::Val
                 "success_count": k.success_count,
                 "fail_count": k.fail_count,
                 "total_fail_count": k.total_fail_count,
+                "last_success_at": k.last_success_at,
+                "last_error_at": k.last_error_at,
+                "last_error_status": k.last_error_status,
+                "status_updated_at": k.status_updated_at,
+                "last_recovered_at": k.last_recovered_at,
                 "rpm_limit": k.rpm_limit,
                 "rpd_limit": k.rpd_limit,
+                "rpm_limit_source": k.rpm_limit_source.clone(),
+                "rpd_limit_source": k.rpd_limit_source.clone(),
                 "tpm_limit": k.tpm_limit,
                 "tpd_limit": k.tpd_limit,
                 "rpm_count": k.rpm_count,
                 "rpd_count": k.rpd_count,
                 "tpm_total": k.tpm_prompt_count + k.tpm_completion_count,
                 "tpd_total": k.tpd_prompt_count + k.tpd_completion_count,
+                "rate_usage": key_rate_usage_json(&k),
                 "cooldown_until": k.cooldown_until,
                 "models": k.models,
             })).collect::<Vec<_>>(),
@@ -254,15 +285,16 @@ pub async fn admin_provider_refresh(
     };
 
     // Run health check for this provider
-    let check_timeout = std::time::Duration::from_secs(
-        state.config.watcher.check_timeout_seconds,
-    );
+    let check_timeout = std::time::Duration::from_secs(state.config.watcher.check_timeout_seconds);
     let mut successful_keys = 0usize;
     let mut total_latency = 0u64;
     let mut provider_models = std::collections::BTreeSet::new();
     let mut last_error = String::new();
 
     for (api_key, _tier) in state.keyhub.discovery_keys(&provider_name) {
+        if !state.keyhub.reserve_key(&provider_name, &api_key) {
+            continue;
+        }
         let started = Instant::now();
         match tokio::time::timeout(check_timeout, provider.list_models(&api_key)).await {
             Ok(Ok(models)) => {
@@ -270,12 +302,14 @@ pub async fn admin_provider_refresh(
                 successful_keys += 1;
                 provider_models.extend(models.iter().cloned());
                 state.keyhub.update_models(&provider_name, &api_key, models);
+                state
+                    .keyhub
+                    .report_reserved_success(&provider_name, &api_key, None, None);
             }
             Ok(Err(error)) => {
-                let status = error.http_status();
-                if matches!(status, 401 | 403 | 429) {
-                    state.keyhub.report_failure(&provider_name, &api_key, status);
-                }
+                state
+                    .keyhub
+                    .report_gateway_error(&provider_name, &api_key, &error);
                 last_error = error.to_string();
                 state.keyhub.record_model_error(
                     &provider_name,
@@ -285,7 +319,9 @@ pub async fn admin_provider_refresh(
             }
             Err(_) => {
                 last_error = "Model discovery timed out".into();
-                state.keyhub.record_model_error(&provider_name, &api_key, &last_error);
+                state
+                    .keyhub
+                    .record_model_error(&provider_name, &api_key, &last_error);
             }
         }
     }
@@ -365,6 +401,12 @@ pub async fn admin_provider_test(
             }));
         }
     };
+    if !state.keyhub.reserve_key(&provider_name, &api_key) {
+        return Json(json!({
+            "success": false,
+            "error": "Selected key is no longer available",
+        }));
+    }
 
     // Get the health check model
     let test_model = state
@@ -416,17 +458,24 @@ pub async fn admin_provider_test(
             let latency = started.elapsed().as_millis() as u64;
             state
                 .keyhub
-                .report_success(&provider_name, &api_key, None, None);
+                .report_reserved_success(&provider_name, &api_key, None, None);
 
             // Broadcast event
-            let _ = state.sse_tx.send(json!({
-                "type": "provider_test",
-                "data": { "provider": &provider_name, "success": true, "latency_ms": latency },
-                "timestamp": chrono::Utc::now().timestamp(),
-            }).to_string());
+            let _ = state.sse_tx.send(
+                json!({
+                    "type": "provider_test",
+                    "data": { "provider": &provider_name, "success": true, "latency_ms": latency },
+                    "timestamp": chrono::Utc::now().timestamp(),
+                })
+                .to_string(),
+            );
 
             let body = &response.body;
-            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or(&test_model).to_string();
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&test_model)
+                .to_string();
             let content_preview = body
                 .get("choices")
                 .and_then(|c| c.as_array())
@@ -435,7 +484,11 @@ pub async fn admin_provider_test(
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
                 .map(|s| {
-                    if s.len() > 100 { format!("{}...", &s[..100]) } else { s.to_string() }
+                    if s.len() > 100 {
+                        format!("{}...", &s[..100])
+                    } else {
+                        s.to_string()
+                    }
                 });
 
             Json(json!({
@@ -450,7 +503,9 @@ pub async fn admin_provider_test(
         Ok(Err(e)) => {
             let latency = started.elapsed().as_millis() as u64;
             let status = e.http_status();
-            state.keyhub.report_failure(&provider_name, &api_key, status);
+            state
+                .keyhub
+                .report_gateway_error(&provider_name, &api_key, &e);
             Json(json!({
                 "success": false,
                 "provider": provider_name,
@@ -459,14 +514,12 @@ pub async fn admin_provider_test(
                 "http_status": status,
             }))
         }
-        Err(_) => {
-            Json(json!({
-                "success": false,
-                "provider": provider_name,
-                "error": "Request timed out",
-                "latency_ms": started.elapsed().as_millis() as u64,
-            }))
-        }
+        Err(_) => Json(json!({
+            "success": false,
+            "provider": provider_name,
+            "error": "Request timed out",
+            "latency_ms": started.elapsed().as_millis() as u64,
+        })),
     }
 }
 
@@ -504,7 +557,21 @@ pub async fn admin_provider_models_get(
                         "rpd_limit": null,
                         "tpm_limit": null,
                         "tpd_limit": null,
+                        "effective_rpm_limit": null,
+                        "effective_rpd_limit": null,
+                        "effective_tpm_limit": null,
+                        "effective_tpd_limit": null,
+                        "rpm_remaining": null,
+                        "rpd_remaining": null,
+                        "tpm_remaining": null,
+                        "tpd_remaining": null,
+                        "rpm_unconstrained": false,
+                        "rpd_unconstrained": false,
+                        "tpm_unconstrained": false,
+                        "tpd_unconstrained": false,
                         "keys_healthy": 0,
+                        "available": false,
+                        "unavailable_reason": null,
                     })
                 });
                 entry["key_count"] = json!(entry["key_count"].as_u64().unwrap_or(0) + 1);
@@ -525,15 +592,36 @@ pub async fn admin_provider_models_get(
                     let current = entry["tpd_limit"].as_u64().unwrap_or(0);
                     entry["tpd_limit"] = json!(current + tpd as u64);
                 }
-                if key.status == crate::models::KeyStatus::Available {
+                let now_secs = chrono::Utc::now().timestamp() as u64;
+                if key.status == crate::models::KeyStatus::Available
+                    && !key.is_rate_limited(now_secs)
+                {
                     entry["keys_healthy"] = json!(entry["keys_healthy"].as_u64().unwrap_or(0) + 1);
+                    add_effective_model_capacity(entry, key, now_secs);
                 }
             }
         }
     }
 
+    for model in model_map.values_mut() {
+        let enabled = model["enabled"].as_bool().unwrap_or(false);
+        let healthy = model["keys_healthy"].as_u64().unwrap_or(0);
+        let available = enabled && healthy > 0;
+        model["available"] = json!(available);
+        model["unavailable_reason"] = if !enabled {
+            json!("disabled")
+        } else if healthy == 0 {
+            json!("no_available_key")
+        } else {
+            serde_json::Value::Null
+        };
+    }
+
     let models: Vec<serde_json::Value> = model_map.into_values().collect();
-    let enabled_count = models.iter().filter(|m| m["enabled"].as_bool().unwrap_or(false)).count();
+    let enabled_count = models
+        .iter()
+        .filter(|m| m["enabled"].as_bool().unwrap_or(false))
+        .count();
     let disabled_count = models.len() - enabled_count;
 
     Json(json!({
@@ -543,6 +631,73 @@ pub async fn admin_provider_models_get(
         "enabled_count": enabled_count,
         "disabled_count": disabled_count,
     }))
+}
+
+fn add_effective_model_capacity(
+    entry: &mut serde_json::Value,
+    key: &crate::models::KeyState,
+    now_secs: u64,
+) {
+    let now_min = now_secs / 60;
+    let now_day = now_secs / 86400;
+    let axes = [
+        (
+            "rpm",
+            key.rpm_limit,
+            if key.rpm_window_start == now_min {
+                key.rpm_count
+            } else {
+                0
+            },
+        ),
+        (
+            "rpd",
+            key.rpd_limit,
+            if key.rpd_window_start == now_day {
+                key.rpd_count
+            } else {
+                0
+            },
+        ),
+        (
+            "tpm",
+            key.tpm_limit,
+            if key.rpm_window_start == now_min {
+                key.tpm_prompt_count
+                    .saturating_add(key.tpm_completion_count)
+            } else {
+                0
+            },
+        ),
+        (
+            "tpd",
+            key.tpd_limit,
+            if key.rpd_window_start == now_day {
+                key.tpd_prompt_count
+                    .saturating_add(key.tpd_completion_count)
+            } else {
+                0
+            },
+        ),
+    ];
+
+    for (axis, limit, used) in axes {
+        if let Some(limit) = limit {
+            add_u64_field(entry, &format!("effective_{axis}_limit"), limit as u64);
+            add_u64_field(
+                entry,
+                &format!("{axis}_remaining"),
+                limit.saturating_sub(used) as u64,
+            );
+        } else {
+            entry[format!("{axis}_unconstrained")] = json!(true);
+        }
+    }
+}
+
+fn add_u64_field(entry: &mut serde_json::Value, field: &str, value: u64) {
+    let current = entry[field].as_u64().unwrap_or(0);
+    entry[field] = json!(current + value);
 }
 
 /// POST /admin/providers/{name}/models/{model}/toggle — Toggle a model's enabled/disabled status.
@@ -561,15 +716,18 @@ pub async fn admin_provider_models_toggle(
     }
 
     // Broadcast SSE event
-    let _ = state.sse_tx.send(json!({
-        "type": "model_toggle",
-        "data": {
-            "provider": &provider_name,
-            "model": &model_id,
-            "enabled": now_enabled,
-        },
-        "timestamp": chrono::Utc::now().timestamp(),
-    }).to_string());
+    let _ = state.sse_tx.send(
+        json!({
+            "type": "model_toggle",
+            "data": {
+                "provider": &provider_name,
+                "model": &model_id,
+                "enabled": now_enabled,
+            },
+            "timestamp": chrono::Utc::now().timestamp(),
+        })
+        .to_string(),
+    );
 
     tracing::info!(
         provider = %provider_name,
@@ -584,6 +742,51 @@ pub async fn admin_provider_models_toggle(
         "model": model_id,
         "enabled": now_enabled,
     }))
+}
+
+/// POST /admin/providers/{name}/keys/{key_id}/restore — Manually restore a disabled key.
+pub async fn admin_provider_key_restore(
+    State(state): State<AppState>,
+    Path((provider_name, key_id)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    match state.keyhub.restore_key(&provider_name, &key_id) {
+        Ok(key) => {
+            let _ = state.sse_tx.send(
+                json!({
+                    "type": "key_restore",
+                    "data": {
+                        "provider": &provider_name,
+                        "key_id": &key_id,
+                        "status": key.status,
+                    },
+                    "timestamp": chrono::Utc::now().timestamp(),
+                })
+                .to_string(),
+            );
+
+            Json(json!({
+                "success": true,
+                "provider": provider_name,
+                "key_id": key_id,
+                "key": {
+                    "key_id": key.key_id,
+                    "key": key.masked_key(),
+                    "status": key.status,
+                    "fail_count": key.fail_count,
+                    "last_error_at": key.last_error_at,
+                    "last_error_status": key.last_error_status,
+                    "status_updated_at": key.status_updated_at,
+                    "last_recovered_at": key.last_recovered_at,
+                },
+            }))
+        }
+        Err(error) => Json(json!({
+            "success": false,
+            "provider": provider_name,
+            "key_id": key_id,
+            "error": error.to_string(),
+        })),
+    }
 }
 
 /// POST /admin/save — Persist current state (disabled_models, keyhub states) to state.json.
@@ -639,13 +842,45 @@ pub async fn admin_keys(State(state): State<AppState>) -> Json<serde_json::Value
                 let rpd_window_active = k.rpd_window_start == now_day;
                 let rpm_used = if rpm_window_active { k.rpm_count } else { 0 };
                 let rpd_used = if rpd_window_active { k.rpd_count } else { 0 };
-                let tpm_used = if rpm_window_active { k.tpm_prompt_count + k.tpm_completion_count } else { 0 };
-                let tpd_used = if rpd_window_active { k.tpd_prompt_count + k.tpd_completion_count } else { 0 };
+                let tpm_used = if rpm_window_active {
+                    k.tpm_prompt_count + k.tpm_completion_count
+                } else {
+                    0
+                };
+                let tpd_used = if rpd_window_active {
+                    k.tpd_prompt_count + k.tpd_completion_count
+                } else {
+                    0
+                };
 
-                let rpm_pct = k.rpm_limit.map(|lim| if lim > 0 { (rpm_used as f64 / lim as f64) * 100.0 } else { 100.0 });
-                let rpd_pct = k.rpd_limit.map(|lim| if lim > 0 { (rpd_used as f64 / lim as f64) * 100.0 } else { 100.0 });
-                let tpm_pct = k.tpm_limit.map(|lim| if lim > 0 { (tpm_used as f64 / lim as f64) * 100.0 } else { 100.0 });
-                let tpd_pct = k.tpd_limit.map(|lim| if lim > 0 { (tpd_used as f64 / lim as f64) * 100.0 } else { 100.0 });
+                let rpm_pct = k.rpm_limit.map(|lim| {
+                    if lim > 0 {
+                        (rpm_used as f64 / lim as f64) * 100.0
+                    } else {
+                        100.0
+                    }
+                });
+                let rpd_pct = k.rpd_limit.map(|lim| {
+                    if lim > 0 {
+                        (rpd_used as f64 / lim as f64) * 100.0
+                    } else {
+                        100.0
+                    }
+                });
+                let tpm_pct = k.tpm_limit.map(|lim| {
+                    if lim > 0 {
+                        (tpm_used as f64 / lim as f64) * 100.0
+                    } else {
+                        100.0
+                    }
+                });
+                let tpd_pct = k.tpd_limit.map(|lim| {
+                    if lim > 0 {
+                        (tpd_used as f64 / lim as f64) * 100.0
+                    } else {
+                        100.0
+                    }
+                });
 
                 json!({
                     "key_id": k.key_id,
@@ -655,14 +890,20 @@ pub async fn admin_keys(State(state): State<AppState>) -> Json<serde_json::Value
                     "success_count": k.success_count,
                     "fail_count": k.fail_count,
                     "total_fail_count": k.total_fail_count,
+                    "last_success_at": k.last_success_at,
+                    "last_error_at": k.last_error_at,
+                    "last_error_status": k.last_error_status,
+                    "status_updated_at": k.status_updated_at,
+                    "last_recovered_at": k.last_recovered_at,
                     "cooldown_until": k.cooldown_until,
                     "models": k.models,
                     "rate_limits": {
-                        "rpm": { "limit": k.rpm_limit, "used": rpm_used, "percent": rpm_pct },
-                        "rpd": { "limit": k.rpd_limit, "used": rpd_used, "percent": rpd_pct },
+                        "rpm": { "limit": k.rpm_limit, "used": rpm_used, "percent": rpm_pct, "source": k.rpm_limit_source.clone() },
+                        "rpd": { "limit": k.rpd_limit, "used": rpd_used, "percent": rpd_pct, "source": k.rpd_limit_source.clone() },
                         "tpm": { "limit": k.tpm_limit, "used": tpm_used, "percent": tpm_pct },
                         "tpd": { "limit": k.tpd_limit, "used": tpd_used, "percent": tpd_pct },
                     },
+                    "rate_usage": key_rate_usage_json(&k),
                 })
             })
             .collect();
@@ -672,6 +913,79 @@ pub async fn admin_keys(State(state): State<AppState>) -> Json<serde_json::Value
     Json(json!({
         "providers": providers,
     }))
+}
+
+fn key_rate_usage_json(k: &crate::models::KeyState) -> serde_json::Value {
+    let now_secs = chrono::Utc::now().timestamp() as u64;
+    let now_min = now_secs / 60;
+    let now_day = now_secs / 86400;
+    let rpm_used = if k.rpm_window_start == now_min {
+        k.rpm_count
+    } else {
+        0
+    };
+    let rpd_used = if k.rpd_window_start == now_day {
+        k.rpd_count
+    } else {
+        0
+    };
+    let tpm_used = if k.rpm_window_start == now_min {
+        k.tpm_prompt_count.saturating_add(k.tpm_completion_count)
+    } else {
+        0
+    };
+    let tpd_used = if k.rpd_window_start == now_day {
+        k.tpd_prompt_count.saturating_add(k.tpd_completion_count)
+    } else {
+        0
+    };
+
+    let axes = [
+        ("rpm", k.rpm_limit, rpm_used, k.rpm_window_start == now_min),
+        ("rpd", k.rpd_limit, rpd_used, k.rpd_window_start == now_day),
+        ("tpm", k.tpm_limit, tpm_used, k.rpm_window_start == now_min),
+        ("tpd", k.tpd_limit, tpd_used, k.rpd_window_start == now_day),
+    ];
+    let mut axis_json = serde_json::Map::new();
+    let mut max_percent = 0.0_f64;
+    let mut constrained = false;
+    let mut exhausted = false;
+
+    for (name, limit, used, window_active) in axes {
+        let remaining = limit.map(|limit| limit.saturating_sub(used));
+        let percent = limit.map(|limit| {
+            if limit == 0 {
+                100.0
+            } else {
+                ((used as f64 / limit as f64) * 100.0).min(100.0)
+            }
+        });
+        if let Some(percent) = percent {
+            constrained = true;
+            max_percent = max_percent.max(percent);
+        }
+        let axis_exhausted = limit.is_some_and(|limit| used >= limit);
+        exhausted = exhausted || axis_exhausted;
+        axis_json.insert(
+            name.to_string(),
+            json!({
+                "limit": limit,
+                "used": used,
+                "remaining": remaining,
+                "percent": percent,
+                "window_active": window_active,
+                "exhausted": axis_exhausted,
+            }),
+        );
+    }
+
+    json!({
+        "axes": axis_json,
+        "constrained": constrained,
+        "exhausted": exhausted,
+        "max_percent": if constrained { Some(max_percent) } else { None },
+        "headroom_percent": if constrained { Some((100.0 - max_percent).max(0.0)) } else { None },
+    })
 }
 
 /// GET /admin/events — SSE endpoint for real-time dashboard updates.
@@ -707,7 +1021,8 @@ pub async fn admin_metadata_stats(State(state): State<AppState>) -> Json<serde_j
     };
 
     let error_summary = meta.get_error_summary(30).unwrap_or_default();
-    let mut error_categories: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut error_categories: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
     let mut error_total = 0i64;
     let mut top_failing_models: Vec<serde_json::Value> = Vec::new();
     let mut model_fails: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -733,6 +1048,7 @@ pub async fn admin_metadata_stats(State(state): State<AppState>) -> Json<serde_j
         "with_pricing": stats.with_pricing,
         "synced_sources": stats.synced_sources,
         "usage_records": stats.usage_records,
+        "learned_rate_limits": stats.learned_rate_limits,
         "error_total": error_total,
         "error_categories": error_categories,
         "top_failing_models": top_failing_models,
@@ -740,63 +1056,94 @@ pub async fn admin_metadata_stats(State(state): State<AppState>) -> Json<serde_j
 }
 
 /// GET /admin/metadata/models — List all learned model metadata.
-pub async fn admin_metadata_models(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn admin_metadata_models(State(state): State<AppState>) -> Json<serde_json::Value> {
     let Some(ref meta) = state.model_meta else {
         return Json(json!({ "models": [], "total": 0 }));
     };
 
     match meta.list_models(None) {
         Ok(rows) => {
-            let models: Vec<serde_json::Value> = rows.iter().map(|m| json!({
-                "provider": m.provider,
-                "model_id": m.model_id,
-                "display_name": m.display_name,
-                "context_window": m.context_window,
-                "max_completion_tokens": m.max_completion_tokens,
-                "supports_vision": m.supports_vision,
-                "supports_tools": m.supports_tools,
-                "supports_reasoning": m.supports_reasoning,
-                "pricing_prompt": m.pricing_prompt,
-                "pricing_completion": m.pricing_completion,
-                "architecture_modality": m.architecture_modality,
-                "rpm_limit": m.rpm_limit,
-                "rpd_limit": m.rpd_limit,
-                "tpm_limit": m.tpm_limit,
-                "tpd_limit": m.tpd_limit,
-                "source": m.source,
-                "first_seen_at": m.first_seen_at,
-                "last_updated_at": m.last_updated_at,
-                "update_count": m.update_count,
-            })).collect();
+            let models: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|m| {
+                    json!({
+                        "provider": m.provider,
+                        "model_id": m.model_id,
+                        "display_name": m.display_name,
+                        "context_window": m.context_window,
+                        "max_completion_tokens": m.max_completion_tokens,
+                        "supports_vision": m.supports_vision,
+                        "supports_tools": m.supports_tools,
+                        "supports_reasoning": m.supports_reasoning,
+                        "pricing_prompt": m.pricing_prompt,
+                        "pricing_completion": m.pricing_completion,
+                        "architecture_modality": m.architecture_modality,
+                        "rpm_limit": m.rpm_limit,
+                        "rpd_limit": m.rpd_limit,
+                        "tpm_limit": m.tpm_limit,
+                        "tpd_limit": m.tpd_limit,
+                        "source": m.source,
+                        "first_seen_at": m.first_seen_at,
+                        "last_updated_at": m.last_updated_at,
+                        "update_count": m.update_count,
+                    })
+                })
+                .collect();
             Json(json!({ "models": models, "total": models.len() }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
 
-/// GET /admin/metadata/usage — Usage summary (last N days).
+/// GET /admin/metadata/usage — Usage summary. Defaults to all known history.
 pub async fn admin_metadata_usage(
     State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
     let Some(ref meta) = state.model_meta else {
         return Json(json!({ "usage": [], "total": 0 }));
     };
 
-    match meta.get_usage_summary(30) {
+    let days = query
+        .get("days")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    match meta.get_usage_summary(days) {
         Ok(rows) => {
-            let usage: Vec<serde_json::Value> = rows.iter().map(|u| json!({
-                "provider": u.provider,
-                "model_id": u.model_id,
-                "total_requests": u.total_requests,
-                "total_prompt_tokens": u.total_prompt_tokens,
-                "total_completion_tokens": u.total_completion_tokens,
-                "total_success": u.total_success,
-                "total_errors": u.total_errors,
-                "last_used_at": u.last_used_at,
-            })).collect();
-            Json(json!({ "usage": usage, "total": usage.len() }))
+            let total_requests: i64 = rows.iter().map(|u| u.total_requests).sum();
+            let total_prompt_tokens: i64 = rows.iter().map(|u| u.total_prompt_tokens).sum();
+            let total_completion_tokens: i64 = rows.iter().map(|u| u.total_completion_tokens).sum();
+            let total_success: i64 = rows.iter().map(|u| u.total_success).sum();
+            let total_errors: i64 = rows.iter().map(|u| u.total_errors).sum();
+            let usage: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|u| {
+                    json!({
+                        "provider": u.provider,
+                        "model_id": u.model_id,
+                        "total_requests": u.total_requests,
+                        "total_prompt_tokens": u.total_prompt_tokens,
+                        "total_completion_tokens": u.total_completion_tokens,
+                        "total_success": u.total_success,
+                        "total_errors": u.total_errors,
+                        "last_used_at": u.last_used_at,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "usage": usage,
+                "total": usage.len(),
+                "summary": {
+                    "window_days": if days > 0 { serde_json::Value::from(days) } else { serde_json::Value::Null },
+                    "total_requests": total_requests,
+                    "total_prompt_tokens": total_prompt_tokens,
+                    "total_completion_tokens": total_completion_tokens,
+                    "total_tokens": total_prompt_tokens + total_completion_tokens,
+                    "total_success": total_success,
+                    "total_errors": total_errors,
+                }
+            }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
@@ -810,12 +1157,17 @@ pub async fn admin_metadata_errors(State(state): State<AppState>) -> Json<serde_
 
     match meta.get_error_summary(30) {
         Ok(rows) => {
-            let errors: Vec<serde_json::Value> = rows.iter().map(|e| json!({
-                "provider": e.provider,
-                "model_id": e.model_id,
-                "category": e.category,
-                "total": e.total,
-            })).collect();
+            let errors: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|e| {
+                    json!({
+                        "provider": e.provider,
+                        "model_id": e.model_id,
+                        "category": e.category,
+                        "total": e.total,
+                    })
+                })
+                .collect();
             Json(json!({ "errors": errors, "total": errors.len() }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
@@ -830,13 +1182,18 @@ pub async fn admin_metadata_sync_status(State(state): State<AppState>) -> Json<s
 
     match meta.get_sync_status() {
         Ok(rows) => {
-            let sources: Vec<serde_json::Value> = rows.iter().map(|s| json!({
-                "source_name": s.source_name,
-                "last_sync_at": s.last_sync_at,
-                "items_found": s.items_found,
-                "items_updated": s.items_updated,
-                "error_message": s.error_message,
-            })).collect();
+            let sources: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|s| {
+                    json!({
+                        "source_name": s.source_name,
+                        "last_sync_at": s.last_sync_at,
+                        "items_found": s.items_found,
+                        "items_updated": s.items_updated,
+                        "error_message": s.error_message,
+                    })
+                })
+                .collect();
             Json(json!({ "sources": sources, "total": sources.len() }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
