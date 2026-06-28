@@ -76,15 +76,7 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
-
-确认：
-
-- `config.yaml` 未被 Git 跟踪
-- 样例配置不包含真实 token
-- `/health`、`/v1/models`、`/admin` 可访问
-- 管理后台能看到 key 状态、用量和错误时间
-
----
+ 
 
 # free-agent-gateway
 
@@ -165,11 +157,5 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-Verify:
-
-- `config.yaml` is not tracked by Git
-- The sample config contains no real tokens
-- `/health`, `/v1/models`, and `/admin` are reachable
-- The admin dashboard shows key status, usage, and error timestamps
-
+ 
 
