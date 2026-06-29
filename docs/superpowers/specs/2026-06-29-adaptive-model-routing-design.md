@@ -75,8 +75,8 @@ POST /agents/document/v1/chat/completions
 ### Provider-Scoped API
 
 ```text
-POST /providers/{provider}/v1/chat/completions
-GET  /providers/{provider}/v1/models
+POST /{provider_name}/v1/chat/completions
+GET  /{provider_name}/v1/models
 ```
 
 This limits candidate selection to one provider. It still selects among that provider's eligible keys and models.
@@ -84,9 +84,20 @@ This limits candidate selection to one provider. It still selects among that pro
 Examples:
 
 ```text
-POST /providers/openrouter/v1/chat/completions
-GET  /providers/nvidia/v1/models
+POST /openrouter/v1/chat/completions
+GET  /nvidia/v1/models
 ```
+
+Provider names used as route prefixes must not collide with reserved gateway namespaces:
+
+- `v1`
+- `auto`
+- `agents`
+- `provider-groups`
+- `admin`
+- `health`
+- `status`
+- `metrics`
 
 ### Provider-Group API
 
@@ -165,7 +176,7 @@ Every adaptive request is classified into a deterministic `TaskProfile`.
 
 Inputs:
 
-- Route namespace: `/auto`, `/agents/{agent}`, `/providers/{provider}`, `/provider-groups/{group}`
+- Route namespace: `/auto`, `/agents/{agent}`, `/{provider_name}`, `/provider-groups/{group}`
 - `X-Agent-Name` or URL agent
 - Requested model name
 - Presence of `tools`
@@ -365,7 +376,7 @@ Adaptive route flow:
 
 ```text
 Client
-  -> /auto/v1 or /agents/{agent}/v1 or /providers/{provider}/v1
+  -> /auto/v1 or /agents/{agent}/v1 or /{provider_name}/v1
   -> parse OpenAI-compatible request
   -> build TaskProfile
   -> resolve route constraints
@@ -394,7 +405,7 @@ Provider aggregation is exposed in three ways:
 1. `/auto/v1/models`
    Lists adaptive-visible models across all eligible providers.
 
-2. `/providers/{provider}/v1/models`
+2. `/{provider_name}/v1/models`
    Lists models available through that provider's eligible keys.
 
 3. `/provider-groups/{group}/v1/models`
@@ -469,7 +480,7 @@ Regression coverage should include:
 - Existing `/v1` behavior remains unchanged.
 - `/auto/v1` accepts OpenAI-compatible chat requests.
 - `/agents/{agent}/v1` sets agent context without requiring headers.
-- `/providers/{provider}/v1` restricts candidates to one provider.
+- `/{provider_name}/v1` restricts candidates to one provider.
 - `/provider-groups/{group}/v1` restricts candidates to configured providers.
 - Vision request rejects or deprioritizes non-vision models.
 - Tool request prefers tool-capable models.
