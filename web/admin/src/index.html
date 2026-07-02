@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>free-agent-gateway Admin</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="admin-page">
+      <section class="admin-panel" aria-label="free-agent-gateway admin console">
+        <header class="topbar">
+          <div>
+            <h1>free-agent-gateway</h1>
+            <p id="status-line">Loading console...</p>
+          </div>
+          <nav class="main-nav" aria-label="Main navigation">
+            <button class="nav-button active" type="button" data-section="usage">Usage</button>
+            <button class="nav-button" type="button" data-section="routes">Routes</button>
+            <button class="nav-button" type="button" data-section="health">Health</button>
+            <a class="nav-link" href="/admin/legacy">Legacy</a>
+            <button class="icon-button" type="button" id="refresh-button" aria-label="Refresh">R</button>
+          </nav>
+        </header>
+
+        <section id="usage-section" class="section active">
+          <div class="usage-toolbar">
+            <div class="segmented" role="tablist" aria-label="Usage view">
+              <button class="segment active" type="button" data-mode="overview">Overview</button>
+              <button class="segment" type="button" data-mode="models">Models</button>
+            </div>
+            <div class="range-tools">
+              <div class="segmented" aria-label="Time range">
+                <button class="segment" type="button" data-days="0">All</button>
+                <button class="segment" type="button" data-days="90">90d</button>
+                <button class="segment" type="button" data-days="30">30d</button>
+                <button class="segment active" type="button" data-days="7">7d</button>
+                <button class="segment" type="button" data-days="1">1d</button>
+              </div>
+            </div>
+          </div>
+
+          <section id="overview-view" class="view active">
+            <div class="metric-grid" id="metric-grid"></div>
+            <div class="heatmap-wrap">
+              <div class="heatmap" id="usage-heatmap"></div>
+            </div>
+            <p class="summary-line" id="summary-line"></p>
+          </section>
+
+          <section id="models-view" class="view">
+            <div class="model-chart" id="model-chart"></div>
+            <div class="model-list" id="model-list"></div>
+          </section>
+        </section>
+
+        <section id="routes-section" class="section">
+          <div class="route-summary" id="route-summary"></div>
+          <div class="split-grid">
+            <section class="data-block">
+              <div class="block-header">
+                <h2>OpenAI Routes</h2>
+                <span id="route-count">0</span>
+              </div>
+              <div class="route-list" id="route-list"></div>
+            </section>
+            <section class="data-block">
+              <div class="block-header">
+                <h2>Provider Groups</h2>
+                <span id="group-count">0</span>
+              </div>
+              <div class="route-list" id="group-list"></div>
+            </section>
+          </div>
+          <section class="data-block family-block">
+            <div class="block-header">
+              <h2>Model Families</h2>
+              <span id="family-count">0</span>
+            </div>
+            <div class="route-list family-list" id="family-list"></div>
+          </section>
+        </section>
+
+        <section id="health-section" class="section">
+          <div class="route-summary" id="health-summary"></div>
+          <section class="data-block analysis-block">
+            <div class="block-header">
+              <h2>Routing Analysis</h2>
+              <span id="analysis-count">0</span>
+            </div>
+            <div class="analysis-list" id="analysis-list"></div>
+          </section>
+          <div class="split-grid health-grid">
+            <section class="data-block">
+              <div class="block-header">
+                <h2>Deployment State</h2>
+                <span id="deployment-count">0</span>
+              </div>
+              <div class="route-list" id="deployment-list"></div>
+            </section>
+            <section class="data-block">
+              <div class="block-header">
+                <h2>Recent Attempts</h2>
+                <span id="attempt-count">0</span>
+              </div>
+              <div class="route-list" id="attempt-list"></div>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

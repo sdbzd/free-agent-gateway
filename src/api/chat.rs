@@ -327,6 +327,7 @@ mod tests {
             provider_type: ProviderType::OpenaiCompatible,
             enabled: true,
             base_url: "http://slow".into(),
+            proxy_url: None,
             keys: vec![KeyConfig::detailed("slow-key", KeyTier::Free)],
             health_check_model: "slow-model".into(),
             timeout_seconds: 1,
@@ -359,6 +360,8 @@ mod tests {
             watcher: WatcherConfig::default(),
             state: StateConfig::default(),
             cors: CorsConfig::default(),
+            adaptive_routing: Default::default(),
+            context_compression: Default::default(),
         });
         let providers = Arc::new(DashMap::new());
         providers.insert(

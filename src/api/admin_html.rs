@@ -5,8 +5,18 @@ use crate::AppState;
 
 /// GET /admin — Serve the admin dashboard HTML.
 pub async fn admin_index(State(_state): State<AppState>) -> Html<&'static str> {
+    Html(ADMIN_USAGE_DASHBOARD_HTML)
+}
+
+pub async fn admin_usage_index(State(_state): State<AppState>) -> Html<&'static str> {
+    Html(ADMIN_USAGE_DASHBOARD_HTML)
+}
+
+pub async fn admin_legacy_index(State(_state): State<AppState>) -> Html<&'static str> {
     Html(ADMIN_DASHBOARD_HTML)
 }
+
+const ADMIN_USAGE_DASHBOARD_HTML: &str = include_str!("../../web/admin/build/index.html");
 
 const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -184,6 +194,12 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .btn.danger:hover { background: rgba(233,69,96,0.2); }
   .btn.success { border-color: var(--success); color: var(--success); }
   .btn.success:hover { background: rgba(78,204,163,0.2); }
+  .btn.validate {
+    background: #0ea5e9;
+    border-color: #38bdf8;
+    color: #fff;
+  }
+  .btn.validate:hover { background: #0284c7; border-color: #7dd3fc; }
   .model-section {
     background: var(--card);
     border: 1px solid var(--border);
@@ -719,15 +735,23 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   }
   .key-entry .key-restore-btn {
     border: 1px solid var(--success);
-    background: transparent;
+    background: rgba(78,204,163,0.12);
     color: var(--success);
     border-radius: 4px;
     padding: 2px 8px;
     font-size: 10px;
     cursor: pointer;
   }
+  .key-entry .key-validate-btn {
+    border-color: #38bdf8;
+    background: #0ea5e9;
+    color: #fff;
+  }
   .key-entry .key-restore-btn:hover {
     background: rgba(0,255,136,0.12);
+  }
+  .key-entry .key-validate-btn:hover {
+    background: #0284c7;
   }
   .key-entry .key-restore-btn:disabled {
     opacity: 0.6;
@@ -740,6 +764,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     font-weight: 600;
   }
   .key-status-badge.available { background: rgba(0,255,136,0.15); color: var(--success); }
+  .key-status-badge.probing { background: rgba(56,189,248,0.15); color: #38bdf8; }
   .key-status-badge.cooldown { background: rgba(255,170,0,0.15); color: var(--warning); }
   .key-status-badge.rate_limited { background: rgba(255,68,68,0.15); color: var(--danger); }
   .key-status-badge.disabled { background: rgba(85,85,85,0.2); color: var(--text-dim); }
@@ -771,6 +796,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
   }
   .pill-status-dot.available { background: var(--success); box-shadow: 0 0 4px var(--success); }
+  .pill-status-dot.probing { background: #38bdf8; box-shadow: 0 0 4px #38bdf8; }
   .pill-status-dot.cooldown { background: var(--warning); box-shadow: 0 0 4px var(--warning); }
   .pill-status-dot.rate_limited { background: var(--danger); box-shadow: 0 0 4px var(--danger); }
   .pill-status-dot.disabled { background: #555; }
@@ -836,6 +862,7 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </div>
 
 <div class="tabs">
+  <div class="tab" data-tab="routing" onclick="switchTab('routing')">Routes</div>
   <div class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">📊 Dashboard</div>
   <div class="tab" data-tab="models" onclick="switchTab('models')">🗄️ Models</div>
   <div class="tab" data-tab="usage" onclick="switchTab('usage')">🔤 Usage</div>
@@ -900,8 +927,39 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Routing Tab -->
+  <div class="tab-content" id="tab-routing">
+    <div class="stats-bar" id="routing-stats-bar">
+      <div class="stat-card"><div class="label">Adaptive</div><div class="value" id="routing-enabled">...</div></div>
+      <div class="stat-card"><div class="label">Routes</div><div class="value" id="routing-total">...</div></div>
+      <div class="stat-card"><div class="label">Provider Routes</div><div class="value" id="routing-provider-total">...</div></div>
+      <div class="stat-card"><div class="label">Groups</div><div class="value" id="routing-group-total">...</div></div>
+    </div>
+    <div class="model-section">
+      <div class="model-section-header">
+        <span>OpenAI-compatible route prefixes</span>
+        <span class="count" id="routing-route-count">Loading...</span>
+      </div>
+      <div class="model-list" id="routing-route-list">
+        <div class="empty-state">Loading routes...</div>
+      </div>
+    </div>
+    <div class="model-section">
+      <div class="model-section-header">
+        <span>Provider groups</span>
+        <span class="count" id="routing-group-count">Loading...</span>
+      </div>
+      <div class="model-list" id="routing-group-list">
+        <div class="empty-state">Loading groups...</div>
+      </div>
+    </div>
+  </div>
+
   <!-- Usage Tab -->
   <div class="tab-content" id="tab-usage">
+    <div class="toolbar" style="justify-content:flex-end;margin-bottom:12px;">
+      <a class="btn primary" href="/admin" target="_blank">Open new web console</a>
+    </div>
     <div class="stats-bar" id="usage-stats-bar">
       <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="usage-total-tokens">—</div></div>
       <div class="stat-card"><div class="label">Prompt Tokens</div><div class="value" id="usage-prompt-tokens">—</div></div>
@@ -909,6 +967,20 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="stat-card"><div class="label">Requests</div><div class="value" id="usage-requests">—</div></div>
       <div class="stat-card"><div class="label">Success</div><div class="value green" id="usage-success">—</div></div>
       <div class="stat-card"><div class="label">Errors</div><div class="value red" id="usage-errors">—</div></div>
+    </div>
+    <div class="model-section">
+      <div class="model-section-header">
+        <span>Daily reported token trend</span>
+        <span class="count">
+          <button class="btn" onclick="setUsageWindow(1)">1d</button>
+          <button class="btn" onclick="setUsageWindow(7)">7d</button>
+          <button class="btn" onclick="setUsageWindow(30)">30d</button>
+          <button class="btn" onclick="setUsageWindow(90)">90d</button>
+        </span>
+      </div>
+      <div class="model-list" id="usage-daily-grid">
+        <div class="empty-state">Loading daily usage...</div>
+      </div>
     </div>
     <div style="overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);">
       <table id="usage-table" style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -919,8 +991,8 @@ const ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             <th>Requests</th>
             <th>Prompt</th>
             <th>Completion</th>
-            <th>Total Tokens</th>
-            <th>Success</th>
+            <th>Reported Tokens</th>
+            <th>Coverage</th>
             <th>Errors</th>
             <th>Last Used</th>
           </tr>
@@ -1069,6 +1141,8 @@ const state = {
   status: null,
   config: null,
   models: null,
+  routingRoutes: null,
+  routingGroups: null,
   sseConnected: false,
 };
 
@@ -1090,6 +1164,9 @@ function switchTab(name) {
   }
   if (name === 'usage') {
     loadUsagePage();
+  }
+  if (name === 'routing') {
+    loadRoutingPage();
   }
   if (name === 'chat') {
     populateChatProviders();
@@ -1210,6 +1287,7 @@ function renderKeyDetails(provider, keys) {
   return keys.map(k => {
     const st = k.status || 'unknown';
     const statusBadge = `<span class="key-status-badge ${st}">${st}</span>`;
+    const validateButton = `<button class="key-restore-btn key-validate-btn" onclick="event.stopPropagation();validateKey('${provider}','${k.key_id}',this)">Validate</button>`;
     const restoreButton = st === 'disabled'
       ? `<button class="key-restore-btn" onclick="event.stopPropagation();restoreKey('${provider}','${k.key_id}',this)">Restore</button>`
       : '';
@@ -1222,7 +1300,7 @@ function renderKeyDetails(provider, keys) {
     return `<div class="key-entry" data-key="">
       <div class="key-header">
         <span class="key-title">🔑 ${k.key} ${statusBadge}${cooldownHtml}</span>
-        <span class="key-meta">${restoreButton}<span>${k.tier || 'unknown'} | ok:${k.success_count} fail:${k.fail_count}</span></span>
+        <span class="key-meta">${validateButton}${restoreButton}<span>${k.tier || 'unknown'} | ok:${k.success_count} fail:${k.fail_count}</span></span>
       </div>
       <div class="rate-rows">
         ${rateBar(k.rpm_limit, usage.rpm ? usage.rpm.used : (k.rpm_count || 0), 'RPM', usage.rpm ? usage.rpm.remaining : null)}
@@ -1261,6 +1339,15 @@ function renderProviders(providers) {
   // otherwise show observed request volume instead of a misleading 0%.
   function keyUsageSummary(k) {
     if (!k) return { text: '0 req', className: 'neutral' };
+    const usage = k.rate_usage || {};
+    if (k.status === 'rate_limited') return { text: 'limited', className: 'bad' };
+    if (k.status === 'probing') return { text: 'probe', className: 'mid' };
+    if (k.status === 'cooldown') return { text: 'cooldown', className: 'bad' };
+    if (usage.blocked_by_status) return { text: 'blocked', className: 'bad' };
+    if (typeof usage.display_percent === 'number') {
+      const pct = Math.round(usage.display_percent);
+      return { text: pct + '%', className: pillPctClass(pct) };
+    }
     var pcts = [];
     if (k.rpm_limit && k.rpm_limit > 0) pcts.push((k.rpm_count || 0) / k.rpm_limit * 100);
     if (k.rpd_limit && k.rpd_limit > 0) pcts.push((k.rpd_count || 0) / k.rpd_limit * 100);
@@ -1356,7 +1443,7 @@ function renderProviders(providers) {
         <div class="test-result" id="test-${p.name}"></div>
         <div class="actions">
           <button class="btn success" onclick="refreshProvider('${p.name}', this)">🔄 Refresh</button>
-          <button class="btn primary" onclick="testProvider('${p.name}', this)">🧪 Test</button>
+          <button class="btn validate" onclick="testProvider('${p.name}', this)">🧪 Test</button>
         </div>
       </div>
     `;
@@ -1378,6 +1465,21 @@ function formatNum(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
   if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
   return String(n);
+}
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function copyRoute(route) {
+  navigator.clipboard.writeText(route).then(function() {
+    showToast('Route copied', 'success');
+  }).catch(function() {});
 }
 
 function miniRateBar(limit, used, label) {
@@ -2114,6 +2216,31 @@ async function restoreKey(provider, keyId, btn) {
 }
 
 // ─── Provider Actions ──────────────────────────────
+async function validateKey(provider, keyId, btn) {
+  if (!keyId) {
+    showToast('Missing key id', 'error');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Validating...';
+  }
+  try {
+    const result = await apiPost(`/admin/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(keyId)}/validate`);
+    if (!result.success) throw new Error(result.error || 'validation failed');
+    showToast(`${provider}: key valid (${result.latency_ms}ms)`, 'success');
+    await loadDashboard();
+  } catch (e) {
+    showToast(`Validate failed: ${e.message}`, 'error');
+    await loadDashboard();
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Validate';
+    }
+  }
+}
+
 async function refreshProvider(name, btn) {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Refreshing...';
@@ -2187,6 +2314,95 @@ async function loadModels() {
 }
 
 // ─── Load Config ────────────────────────────────────
+async function loadRoutingPage() {
+  try {
+    const routesData = await apiGet('/admin/routing/routes');
+    const groupsData = await apiGet('/admin/routing/groups');
+    const routes = routesData.routes || [];
+    const groups = groupsData.groups || [];
+    state.routingRoutes = routes;
+    state.routingGroups = groups;
+
+    document.getElementById('routing-enabled').textContent = routesData.enabled ? 'on' : 'off';
+    document.getElementById('routing-enabled').className = routesData.enabled ? 'value green' : 'value red';
+    document.getElementById('routing-total').textContent = routes.length;
+    document.getElementById('routing-provider-total').textContent = routes.filter(function(r) { return r.kind === 'provider'; }).length;
+    document.getElementById('routing-group-total').textContent = groups.length;
+    document.getElementById('routing-route-count').textContent = routes.length + ' routes';
+    document.getElementById('routing-group-count').textContent = groups.length + ' groups';
+
+    renderRoutingRoutes(routes);
+    renderRoutingGroups(groups);
+  } catch (e) {
+    document.getElementById('routing-route-list').innerHTML = '<div class="empty-state">Failed to load routes: ' + escapeHtml(e.message) + '</div>';
+    document.getElementById('routing-group-list').innerHTML = '<div class="empty-state">Failed to load groups: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function renderRoutingRoutes(routes) {
+  var list = document.getElementById('routing-route-list');
+  if (!routes || routes.length === 0) {
+    list.innerHTML = '<div class="empty-state">No adaptive routes configured.</div>';
+    return;
+  }
+  var order = { auto: 0, agent: 1, provider: 2, provider_group: 3 };
+  routes = routes.slice().sort(function(a, b) {
+    var ao = order[a.kind] == null ? 9 : order[a.kind];
+    var bo = order[b.kind] == null ? 9 : order[b.kind];
+    if (ao !== bo) return ao - bo;
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+  list.innerHTML = routes.map(function(route) {
+    var providers = (route.providers || []).join(', ') || '-';
+    var agents = (route.agents || []).join(', ') || '-';
+    var status = route.enabled ? '<span class="green">enabled</span>' : '<span class="red">disabled</span>';
+    return '<div class="meta-model-row" style="padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;">' +
+      '<div style="display:flex;justify-content:space-between;gap:12px;align-items:center;">' +
+        '<div style="min-width:0;flex:1;">' +
+          '<div><span class="type-badge">' + escapeHtml(route.kind) + '</span> <strong>' + escapeHtml(route.name) + '</strong> ' + status + '</div>' +
+          '<div style="font-family:var(--font-mono);font-size:12px;margin-top:4px;word-break:break-all;">' + escapeHtml(route.route_prefix) + '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;flex-shrink:0;">' +
+          '<button class="btn" onclick="copyRoute(\'' + escapeHtml(route.models_route) + '\')">Copy models</button>' +
+          '<button class="btn" onclick="copyRoute(\'' + escapeHtml(route.chat_route) + '\')">Copy chat</button>' +
+        '</div>' +
+      '</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;color:var(--text-dim);font-size:12px;">' +
+        '<div>models: <span style="font-family:var(--font-mono);">' + escapeHtml(route.models_route) + '</span></div>' +
+        '<div>chat: <span style="font-family:var(--font-mono);">' + escapeHtml(route.chat_route) + '</span></div>' +
+        '<div>providers: ' + escapeHtml(providers) + '</div>' +
+        '<div>agents: ' + escapeHtml(agents) + '</div>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function renderRoutingGroups(groups) {
+  var list = document.getElementById('routing-group-list');
+  if (!groups || groups.length === 0) {
+    list.innerHTML = '<div class="empty-state">No provider groups configured.</div>';
+    return;
+  }
+  list.innerHTML = groups.map(function(group) {
+    var providerRows = (group.providers || []).map(function(provider) {
+      var health = provider.health_status || 'unknown';
+      var healthClass = health === 'healthy' ? 'green' : health === 'unhealthy' ? 'red' : 'yellow';
+      return '<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+        '<span><span class="type-badge">' + escapeHtml(provider.name) + '</span> <span class="' + healthClass + '">' + escapeHtml(health) + '</span></span>' +
+        '<span style="color:var(--text-dim);">' + (provider.available_keys || 0) + '/' + (provider.total_keys || 0) + ' keys · ' + (provider.models_count || 0) + ' models</span>' +
+      '</div>';
+    }).join('');
+    return '<div class="meta-model-row" style="padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;">' +
+      '<div style="display:flex;justify-content:space-between;gap:12px;align-items:center;">' +
+        '<div><strong>' + escapeHtml(group.name) + '</strong><div style="font-family:var(--font-mono);font-size:12px;color:var(--text-dim);">' + escapeHtml(group.route_prefix) + '</div></div>' +
+        '<button class="btn" onclick="copyRoute(\'' + escapeHtml(group.route_prefix) + '\')">Copy prefix</button>' +
+      '</div>' +
+      '<div style="margin-top:8px;color:var(--text-dim);font-size:12px;">agents: ' + escapeHtml((group.agents || []).join(', ') || '-') + '</div>' +
+      '<div style="margin-top:8px;">' + providerRows + '</div>' +
+    '</div>';
+  }).join('');
+}
+
 async function loadConfig() {
   const display = document.getElementById('config-display');
   display.textContent = 'Loading...';
@@ -2314,16 +2530,34 @@ async function loadMetadataStats() {
   }
 }
 
+var usageWindowDays = 7;
+
+function setUsageWindow(days) {
+  usageWindowDays = days;
+  loadUsagePage();
+}
+
 async function loadUsagePage() {
   try {
-    var data = await apiGet('/admin/metadata/usage');
+    var data = await apiGet('/admin/metadata/usage?days=' + usageWindowDays);
+    var dailyData = await apiGet('/admin/metadata/usage/daily?days=' + usageWindowDays);
     var summary = data.summary || {};
+    var totalLabel = document.getElementById('usage-total-tokens').parentElement.querySelector('.label');
+    if (totalLabel) totalLabel.textContent = 'Reported Tokens';
+    var coverageLabel = document.getElementById('usage-success').parentElement.querySelector('.label');
+    if (coverageLabel) coverageLabel.textContent = 'Token Coverage';
+    var ths = document.querySelectorAll('#usage-table thead th');
+    if (ths.length >= 8) {
+      ths[5].textContent = 'Reported Tokens';
+      ths[6].textContent = 'Coverage';
+    }
     document.getElementById('usage-total-tokens').textContent = formatNum(summary.total_tokens || 0);
     document.getElementById('usage-prompt-tokens').textContent = formatNum(summary.total_prompt_tokens || 0);
     document.getElementById('usage-completion-tokens').textContent = formatNum(summary.total_completion_tokens || 0);
     document.getElementById('usage-requests').textContent = formatNum(summary.total_requests || 0);
-    document.getElementById('usage-success').textContent = formatNum(summary.total_success || 0);
+    document.getElementById('usage-success').textContent = percentText(summary.token_reporting_coverage);
     document.getElementById('usage-errors').textContent = formatNum(summary.total_errors || 0);
+    renderUsageDailyGrid(dailyData.days || []);
 
     var rows = data.usage || [];
     var body = document.getElementById('usage-table-body');
@@ -2344,6 +2578,7 @@ async function loadUsagePage() {
       var prompt = u.total_prompt_tokens || 0;
       var completion = u.total_completion_tokens || 0;
       var total = prompt + completion;
+      var coverage = percentText(u.token_reporting_coverage);
       var last = u.last_used_at ? new Date(u.last_used_at * 1000).toLocaleString() : '—';
       return '<tr>' +
         '<td><span class="provider-badge">' + (u.provider || 'unknown') + '</span></td>' +
@@ -2352,7 +2587,7 @@ async function loadUsagePage() {
         '<td>' + formatNum(prompt) + '</td>' +
         '<td>' + formatNum(completion) + '</td>' +
         '<td><strong>' + formatNum(total) + '</strong></td>' +
-        '<td class="green">' + formatNum(u.total_success || 0) + '</td>' +
+        '<td class="' + ((u.token_reporting_coverage || 0) < 0.8 ? 'yellow' : 'green') + '">' + coverage + '</td>' +
         '<td class="' + ((u.total_errors || 0) > 0 ? 'red' : '') + '">' + formatNum(u.total_errors || 0) + '</td>' +
         '<td style="color:var(--text-dim);">' + last + '</td>' +
       '</tr>';
@@ -2361,6 +2596,43 @@ async function loadUsagePage() {
     document.getElementById('usage-empty').style.display = 'block';
     document.getElementById('usage-empty').textContent = 'Failed to load usage: ' + e.message;
   }
+}
+
+function percentText(value) {
+  if (value == null) return '--';
+  return Math.round(value * 100) + '%';
+}
+
+function renderUsageDailyGrid(days) {
+  var grid = document.getElementById('usage-daily-grid');
+  if (!grid) return;
+  if (!days.length) {
+    grid.innerHTML = '<div class="empty-state">No daily usage recorded.</div>';
+    return;
+  }
+  var maxTokens = Math.max.apply(null, days.map(function(d) {
+    return (d.total_prompt_tokens || 0) + (d.total_completion_tokens || 0);
+  }));
+  var maxReq = Math.max.apply(null, days.map(function(d) { return d.total_requests || 0; }));
+  grid.innerHTML =
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(34px,1fr));gap:8px;">' +
+    days.map(function(d) {
+      var tokens = (d.total_prompt_tokens || 0) + (d.total_completion_tokens || 0);
+      var intensity = maxTokens > 0 ? tokens / maxTokens : 0;
+      var alpha = (0.12 + intensity * 0.78).toFixed(2);
+      var coverage = percentText(d.token_reporting_coverage);
+      var date = new Date(d.date + 'T00:00:00');
+      var label = (date.getMonth() + 1) + '/' + date.getDate();
+      var border = (d.total_errors || 0) > 0 ? 'var(--danger)' : 'var(--border)';
+      return '<div title="' + escapeHtml(d.date + ': ' + formatNum(tokens) + ' reported tokens, ' + (d.total_requests || 0) + ' requests, coverage ' + coverage) + '" ' +
+        'style="min-height:64px;border:1px solid ' + border + ';border-radius:6px;padding:6px;background:rgba(0,255,136,' + alpha + ');display:flex;flex-direction:column;justify-content:space-between;">' +
+        '<div style="font-size:11px;color:var(--text);font-weight:600;">' + label + '</div>' +
+        '<div style="font-size:12px;font-weight:700;">' + formatNum(tokens) + '</div>' +
+        '<div style="font-size:10px;color:var(--text-dim);">' + (d.total_requests || 0) + '/' + (maxReq || 0) + ' req</div>' +
+      '</div>';
+    }).join('') +
+    '</div>' +
+    '<div style="margin-top:8px;color:var(--text-dim);font-size:12px;">Reported tokens = prompt + completion tokens from upstream usage fields. Coverage shows how many requests included token usage.</div>';
 }
 
 async function loadMetadataSyncStatus() {
@@ -2475,6 +2747,7 @@ loadMetadataStats();
 loadMetadataSyncStatus();
 loadMetadataModels();
 loadMetadataErrors();
+loadRoutingPage();
 connectSSE();
 
 // ─── Chat Test Tab ────────────────────────────────
@@ -2660,6 +2933,7 @@ async function refreshAll() {
       loadMetadataModels(),
       loadMetadataErrors(),
       loadUsagePage(),
+      loadRoutingPage(),
     ]);
     showToast('All data refreshed', 'success');
   } catch (e) {
@@ -2695,6 +2969,7 @@ setInterval(loadModels, 120000);
 setInterval(loadMetadataStats, 120000);
 setInterval(loadMetadataErrors, 120000);
 setInterval(loadUsagePage, 120000);
+setInterval(loadRoutingPage, 120000);
 setInterval(updateUptime, 1000);
 setInterval(updateCooldownTimers, 1000);
 </script>

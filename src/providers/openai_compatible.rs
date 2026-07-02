@@ -4,6 +4,7 @@ use crate::config::ProviderConfig;
 use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
+use crate::providers::{http_client, send_stream_request, streaming_client_with_proxy};
 
 /// Fields that the OpenAI spec does not define and that some OpenAI-compatible
 /// providers (e.g. Cerebras) reject as unsupported parameters.
@@ -25,6 +26,7 @@ fn strip_unsupported_extra_fields(request: &mut ChatCompletionRequest) {
 pub struct OpenAiCompatibleProvider {
     name: String,
     base_url: String,
+    proxy_url: Option<String>,
     health_check_model: String,
     timeout_seconds: u64,
     priority: u32,
@@ -35,14 +37,45 @@ impl OpenAiCompatibleProvider {
         Self {
             name: name.to_string(),
             base_url: config.base_url.clone(),
-            health_check_model: if config.health_check_model.is_empty() {
-                "gpt-4o-mini".into()
-            } else {
-                config.health_check_model.clone()
-            },
+            proxy_url: config.proxy_url.clone(),
+            health_check_model: config.health_check_model.clone(),
             timeout_seconds: config.timeout_seconds,
             priority: config.priority,
         }
+    }
+}
+
+async fn parse_json_body(
+    resp: reqwest::Response,
+    provider_name: &str,
+    endpoint: &str,
+) -> GatewayResult<(u16, bool, Option<u64>, serde_json::Value)> {
+    let status = resp.status().as_u16();
+    let is_success = resp.status().is_success();
+    let retry_after_seconds = retry_after_seconds(resp.headers());
+    let body = resp.text().await?;
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(json) => Ok((status, is_success, retry_after_seconds, json)),
+        Err(error) if is_success => Err(GatewayError::UpstreamError(format!(
+            "non-JSON response from upstream provider={provider_name} endpoint={endpoint} status={status}: {error}; body_preview={}",
+            preview_body(&body)
+        ))),
+        Err(_) => Ok((
+            status,
+            is_success,
+            retry_after_seconds,
+            serde_json::json!({ "error": { "message": preview_body(&body) } }),
+        )),
+    }
+}
+
+fn preview_body(body: &str) -> String {
+    const LIMIT: usize = 240;
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() > LIMIT {
+        format!("{}...", &compact[..LIMIT])
+    } else {
+        compact
     }
 }
 
@@ -66,7 +99,7 @@ impl Provider for OpenAiCompatibleProvider {
 
     async fn list_models(&self, api_key: &str) -> GatewayResult<Vec<String>> {
         let url = format!("{}/models", self.base_url);
-        let client = reqwest::Client::new();
+        let client = http_client(self.timeout_seconds, self.proxy_url.as_deref())?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {api_key}"))
@@ -124,7 +157,7 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(GatewayError::http_error(status, body, retry_after_seconds));
         }
 
-        let json: serde_json::Value = resp.json().await?;
+        let (_, _, _, json) = parse_json_body(resp, &self.name, "models").await?;
         let models = json["data"]
             .as_array()
             .map(|arr| {
@@ -144,7 +177,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> GatewayResult<ChatResponse> {
         strip_unsupported_extra_fields(&mut request);
         let url = format!("{}/chat/completions", self.base_url);
-        let client = reqwest::Client::new();
+        let client = http_client(self.timeout_seconds, self.proxy_url.as_deref())?;
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {api_key}"))
@@ -154,10 +187,8 @@ impl Provider for OpenAiCompatibleProvider {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        let is_success = resp.status().is_success();
-        let retry_after_seconds = retry_after_seconds(resp.headers());
-        let body: serde_json::Value = resp.json().await?;
+        let (status, is_success, retry_after_seconds, body) =
+            parse_json_body(resp, &self.name, "chat/completions").await?;
         if !is_success {
             // Extract error message, preferring nested details from OpenRouter-style errors
             let msg = body["error"]["metadata"]["raw"]
@@ -185,15 +216,17 @@ impl Provider for OpenAiCompatibleProvider {
         stream_request.stream = Some(true);
 
         let url = format!("{}/chat/completions", self.base_url);
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-            .json(&stream_request)
-            .send()
-            .await?;
+        let client = streaming_client_with_proxy(self.timeout_seconds, self.proxy_url.as_deref())?;
+        let resp = send_stream_request(
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .header("Accept-Encoding", "identity")
+                .json(&stream_request),
+            self.timeout_seconds,
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -218,6 +251,42 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         Ok(elapsed)
+    }
+
+    async fn post_json(
+        &self,
+        api_key: &str,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> GatewayResult<ChatResponse> {
+        let endpoint = endpoint.trim_start_matches('/');
+        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), endpoint);
+        let client = http_client(self.timeout_seconds, self.proxy_url.as_deref())?;
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+            .json(&body)
+            .send()
+            .await?;
+
+        let (status, is_success, retry_after_seconds, body) =
+            parse_json_body(resp, &self.name, endpoint).await?;
+        if !is_success {
+            let msg = body["error"]["metadata"]["raw"]
+                .as_str()
+                .and_then(|raw| {
+                    serde_json::from_str::<serde_json::Value>(raw)
+                        .ok()
+                        .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
+                })
+                .or_else(|| body["error"]["message"].as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| body.to_string());
+            return Err(GatewayError::http_error(status, msg, retry_after_seconds));
+        }
+
+        Ok(ChatResponse { body, status })
     }
 }
 

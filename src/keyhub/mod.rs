@@ -115,6 +115,19 @@ fn percent_used(used: u32, limit: u32) -> u32 {
     used.saturating_mul(100) / limit
 }
 
+fn is_request_selectable(key: &KeyState, now_secs: u64) -> bool {
+    matches!(key.status, KeyStatus::Available | KeyStatus::Probing)
+        && !key.is_rate_limited(now_secs)
+}
+
+fn key_usage_sort_key_for_selection(key: &KeyState, now_secs: u64) -> (u32, u32, u32, u32, u32) {
+    let mut sort_key = key_usage_sort_key(key, now_secs);
+    if key.status == KeyStatus::Probing {
+        sort_key.0 = sort_key.0.saturating_add(1000);
+    }
+    sort_key
+}
+
 fn tighten_observed_limit(limit: &mut Option<u32>, observed: u32) {
     if observed == 0 {
         return;
@@ -196,7 +209,7 @@ impl KeyPool {
         let available_indices: Vec<usize> = keys
             .iter()
             .enumerate()
-            .filter(|(_, k)| k.status == KeyStatus::Available && !k.is_rate_limited(now))
+            .filter(|(_, k)| is_request_selectable(k, now))
             .map(|(i, _)| i)
             .collect();
 
@@ -228,7 +241,7 @@ impl KeyPool {
                 // Prefer the key with the smallest max-usage (most headroom).
                 available_indices
                     .iter()
-                    .min_by_key(|&&i| key_usage_sort_key(&keys[i], now))
+                    .min_by_key(|&&i| key_usage_sort_key_for_selection(&keys[i], now))
                     .copied()
                     .unwrap_or(available_indices[0])
             }
@@ -313,7 +326,7 @@ impl KeyPool {
                     KeyStatus::RateLimited => {
                         // 429 rate limit: preserve fail_count so escalation
                         // (2min → 10min → 1hr → 24hr) persists across recovery cycles
-                        key.status = KeyStatus::Available;
+                        key.status = KeyStatus::Probing;
                         key.cooldown_until = None;
                         key.status_updated_at = Some(now);
                         key.last_recovered_at = Some(now);
@@ -322,7 +335,7 @@ impl KeyPool {
                             key = %key.masked_key(),
                             fail_count = key.fail_count,
                             stage = "key_recovery",
-                            "Key recovered from rate limit"
+                            "Key ready for rate-limit recovery probe"
                         );
                     }
                     _ => {}
@@ -345,6 +358,15 @@ impl KeyPool {
             k.success_count += 1;
             k.fail_count = 0;
             k.last_success_at = Some(now);
+            if k.status == KeyStatus::Probing
+                || k.status == KeyStatus::RateLimited
+                || k.status == KeyStatus::Disabled
+                || (k.status == KeyStatus::Cooldown && k.last_error_status == Some(429))
+            {
+                k.status = KeyStatus::Available;
+                k.cooldown_until = None;
+                k.status_updated_at = Some(now);
+            }
 
             // Reset rate windows and increment counters
             k.reset_rate_windows(now);
@@ -378,8 +400,19 @@ impl KeyPool {
             return false;
         };
         k.reset_rate_windows(now);
-        if k.status != KeyStatus::Available || k.is_rate_limited(now) {
+        if !is_request_selectable(k, now) {
             return false;
+        }
+        if k.status == KeyStatus::Probing {
+            k.status = KeyStatus::Cooldown;
+            k.cooldown_until = Some(now + self.routing.cooldown_seconds);
+            k.status_updated_at = Some(now);
+            tracing::info!(
+                provider = %self.provider_name,
+                key = %k.masked_key(),
+                cooldown_s = self.routing.cooldown_seconds,
+                "Key reserved for recovery probe"
+            );
         }
         k.rpm_count = k.rpm_count.saturating_add(1);
         k.rpd_count = k.rpd_count.saturating_add(1);
@@ -399,6 +432,15 @@ impl KeyPool {
             k.success_count += 1;
             k.fail_count = 0;
             k.last_success_at = Some(now);
+            if k.status == KeyStatus::Probing
+                || k.status == KeyStatus::RateLimited
+                || k.status == KeyStatus::Disabled
+                || (k.status == KeyStatus::Cooldown && k.last_error_status == Some(429))
+            {
+                k.status = KeyStatus::Available;
+                k.cooldown_until = None;
+                k.status_updated_at = Some(now);
+            }
             k.reset_rate_windows(now);
 
             if let Some(p) = prompt_tokens {
@@ -426,6 +468,32 @@ impl KeyPool {
         let now = chrono::Utc::now().timestamp() as u64;
         if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
             self.record_general_failure(k, http_status, now);
+        }
+        self.record_provider_failure(keys.len() as u64, now);
+    }
+
+    /// Force a transient key cooldown after a request has already reached the
+    /// upstream response body. At that point the gateway cannot safely switch
+    /// streams in-band, so the key must be removed for the client's next retry.
+    pub fn force_transient_cooldown(&self, key: &str, http_status: u16, reason: &str) {
+        let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
+        if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
+            k.last_error_at = Some(now);
+            k.last_error_status = Some(http_status);
+            k.fail_count = k.fail_count.saturating_add(1);
+            k.total_fail_count = k.total_fail_count.saturating_add(1);
+            k.status = KeyStatus::Cooldown;
+            k.cooldown_until = Some(now + self.routing.cooldown_seconds);
+            k.status_updated_at = Some(now);
+            tracing::warn!(
+                provider = %self.provider_name,
+                key = %k.masked_key(),
+                status = http_status,
+                cooldown_s = self.routing.cooldown_seconds,
+                reason = %reason,
+                "Key entering cooldown due to stream body failure"
+            );
         }
         self.record_provider_failure(keys.len() as u64, now);
     }
@@ -485,6 +553,11 @@ impl KeyPool {
                         }
                     }
                     let tier = (k.fail_count as usize).min(COOLDOWN_ESCALATION_S.len() - 1);
+                    let cooldown_source = if retry_after_seconds.is_some() {
+                        "upstream_retry_after"
+                    } else {
+                        "local_escalation"
+                    };
                     let cooldown_s = retry_after_seconds.unwrap_or(COOLDOWN_ESCALATION_S[tier]);
                     k.status = KeyStatus::RateLimited;
                     k.cooldown_until = Some(now + cooldown_s);
@@ -495,6 +568,8 @@ impl KeyPool {
                         provider = %self.provider_name,
                         key = %k.masked_key(),
                         tier = tier,
+                        retry_after_s = retry_after_seconds,
+                        cooldown_source,
                         "Key rate limited, escalating cooldown for {}s",
                         cooldown_s
                     );
@@ -751,6 +826,19 @@ impl KeyHub {
         }
     }
 
+    /// Force a transient key cooldown when the response body fails after a stream was accepted.
+    pub fn force_transient_cooldown(
+        &self,
+        provider_name: &str,
+        key: &str,
+        http_status: u16,
+        reason: &str,
+    ) {
+        if let Some(pool) = self.pools.get(provider_name) {
+            pool.force_transient_cooldown(key, http_status, reason);
+        }
+    }
+
     /// Report failure with optional upstream retry guidance.
     pub fn report_failure_with_retry_after(
         &self,
@@ -766,6 +854,16 @@ impl KeyHub {
 
     /// Report a structured upstream error, preserving auth vs WAF/Cloudflare semantics.
     pub fn report_gateway_error(&self, provider_name: &str, key: &str, error: &GatewayError) {
+        if !error.is_key_attributable_failure() {
+            tracing::debug!(
+                provider = %provider_name,
+                key_id = %key_fingerprint(key),
+                http_status = error.http_status(),
+                error_category = error.category(),
+                "Skipping key state penalty for non-key-attributable upstream error"
+            );
+            return;
+        }
         let status = error.http_status();
         if status == 429 || error.is_auth_failure() {
             self.report_failure_with_retry_after(
@@ -799,6 +897,47 @@ impl KeyHub {
         self.pools
             .get(provider_name)
             .map(|pool| pool.keys.read().iter().map(|key| key.key.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Return raw key material by stable fingerprint for explicit admin validation.
+    pub fn key_by_id(&self, provider_name: &str, key_id: &str) -> GatewayResult<String> {
+        self.pools
+            .get(provider_name)
+            .ok_or_else(|| GatewayError::ProviderNotFound(provider_name.to_string()))?
+            .keys
+            .read()
+            .iter()
+            .find(|key| key_fingerprint(&key.key) == key_id)
+            .map(|key| key.key.clone())
+            .ok_or_else(|| GatewayError::InvalidRequest(format!("Key id not found: {key_id}")))
+    }
+
+    /// Return the discovered model inventory for one raw key.
+    pub fn models_for_key(&self, provider_name: &str, key: &str) -> Vec<String> {
+        self.pools
+            .get(provider_name)
+            .and_then(|pool| {
+                pool.keys
+                    .read()
+                    .iter()
+                    .find(|state| state.key == key)
+                    .map(|state| state.models.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return the discovered model inventory for one key fingerprint.
+    pub fn models_for_key_id(&self, provider_name: &str, key_id: &str) -> Vec<String> {
+        self.pools
+            .get(provider_name)
+            .and_then(|pool| {
+                pool.keys
+                    .read()
+                    .iter()
+                    .find(|state| key_fingerprint(&state.key) == key_id)
+                    .map(|state| state.models.clone())
+            })
             .unwrap_or_default()
     }
 
@@ -859,6 +998,62 @@ impl KeyHub {
             .get(provider_name)
             .map(|pool| pool.available_count())
             .unwrap_or(0)
+    }
+
+    /// Summarize key status for diagnostics without exposing key material.
+    pub fn provider_key_status_summary(&self, provider_name: &str) -> String {
+        self.pools
+            .get(provider_name)
+            .map(|pool| {
+                let now = chrono::Utc::now().timestamp() as u64;
+                let mut keys = pool.keys.write();
+                pool.recover_expired(&mut keys);
+                for key in keys.iter_mut() {
+                    key.reset_rate_windows(now);
+                }
+
+                let provider_cooldown_until =
+                    pool.provider_cooldown_until.load(Ordering::Relaxed);
+                let provider_cooldown_remaining = provider_cooldown_until.saturating_sub(now);
+                let mut available = 0usize;
+                let mut free_available = 0usize;
+                let mut free_probing = 0usize;
+                let mut free_cooldown = 0usize;
+                let mut free_rate_limited = 0usize;
+                let mut free_disabled = 0usize;
+                let mut paid_or_unknown = 0usize;
+
+                for key in keys.iter() {
+                    if key.status == KeyStatus::Available && !key.is_rate_limited(now) {
+                        available += 1;
+                    }
+                    if key.tier != KeyTier::Free {
+                        paid_or_unknown += 1;
+                        continue;
+                    }
+                    match key.status {
+                        KeyStatus::Available if !key.is_rate_limited(now) => free_available += 1,
+                        KeyStatus::Available => free_rate_limited += 1,
+                        KeyStatus::Probing => free_probing += 1,
+                        KeyStatus::Cooldown => free_cooldown += 1,
+                        KeyStatus::RateLimited => free_rate_limited += 1,
+                        KeyStatus::Disabled => free_disabled += 1,
+                    }
+                }
+
+                format!(
+                    "available={}, free_available={}, free_probing={}, free_cooldown={}, free_rate_limited={}, free_disabled={}, paid_or_unknown={}, provider_cooldown_remaining_s={}",
+                    available,
+                    free_available,
+                    free_probing,
+                    free_cooldown,
+                    free_rate_limited,
+                    free_disabled,
+                    paid_or_unknown,
+                    provider_cooldown_remaining
+                )
+            })
+            .unwrap_or_else(|| "provider_not_registered".to_string())
     }
 
     pub fn discovery_keys(&self, provider_name: &str) -> Vec<(String, KeyTier)> {
@@ -983,13 +1178,49 @@ impl KeyHub {
                 keys.iter()
                     .filter(|key| {
                         key.tier == KeyTier::Free
-                            && key.status == KeyStatus::Available
-                            && !key.is_rate_limited(now)
+                            && is_request_selectable(key, now)
                             && key.models.iter().any(|candidate| candidate == model)
                     })
                     .map(|key| FreeKeyCandidate {
                         key: key.key.clone(),
-                        usage_sort_key: key_usage_sort_key(key, now),
+                        usage_sort_key: key_usage_sort_key_for_selection(key, now),
+                        fail_count: key.fail_count,
+                        total_fail_count: key.total_fail_count,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn free_provider_candidate_infos(&self, provider_name: &str) -> Vec<FreeKeyCandidate> {
+        self.pools
+            .get(provider_name)
+            .map(|pool| {
+                // Provider-level cooldown check
+                let now = chrono::Utc::now().timestamp() as u64;
+                let cooldown_until = pool.provider_cooldown_until.load(Ordering::Relaxed);
+                if cooldown_until > 0 {
+                    if now < cooldown_until {
+                        tracing::debug!(
+                            provider = %provider_name,
+                            "Provider in cooldown, skipping provider-level candidate selection"
+                        );
+                        return vec![];
+                    }
+                    pool.provider_cooldown_until.store(0, Ordering::Relaxed);
+                    pool.provider_fail_count.store(0, Ordering::Relaxed);
+                }
+
+                let mut keys = pool.keys.write();
+                pool.recover_expired(&mut keys);
+                for key in keys.iter_mut() {
+                    key.reset_rate_windows(now);
+                }
+                keys.iter()
+                    .filter(|key| key.tier == KeyTier::Free && is_request_selectable(key, now))
+                    .map(|key| FreeKeyCandidate {
+                        key: key.key.clone(),
+                        usage_sort_key: key_usage_sort_key_for_selection(key, now),
                         fail_count: key.fail_count,
                         total_fail_count: key.total_fail_count,
                     })

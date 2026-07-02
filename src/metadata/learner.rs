@@ -202,12 +202,35 @@ impl ModelMetaStore {
         prompt_tokens: Option<i64>,
         completion_tokens: Option<i64>,
     ) {
+        let tokens_reported = prompt_tokens.is_some() || completion_tokens.is_some();
+        self.learn_from_request_with_token_source(
+            provider,
+            model_id,
+            success,
+            prompt_tokens,
+            completion_tokens,
+            tokens_reported,
+        );
+    }
+
+    /// Record request usage while preserving whether tokens came from upstream
+    /// `usage` or from gateway estimation.
+    pub fn learn_from_request_with_token_source(
+        &self,
+        provider: &str,
+        model_id: &str,
+        success: bool,
+        prompt_tokens: Option<i64>,
+        completion_tokens: Option<i64>,
+        tokens_reported: bool,
+    ) {
         if let Err(e) = self.record_usage(
             provider,
             model_id,
             success,
             prompt_tokens,
             completion_tokens,
+            tokens_reported,
         ) {
             tracing::warn!("Failed to record usage for {provider}/{model_id}: {e}");
         }

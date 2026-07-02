@@ -14,8 +14,8 @@ use free_agent_gateway::config::{
     RoutingConfig, RoutingStrategy, ServerConfig,
 };
 use free_agent_gateway::error::{GatewayError, GatewayResult};
-use free_agent_gateway::keyhub::KeyHub;
-use free_agent_gateway::models::{ChatCompletionRequest, ChatMessage};
+use free_agent_gateway::keyhub::{KeyHub, key_fingerprint};
+use free_agent_gateway::models::{ChatCompletionRequest, ChatMessage, KeyStatus};
 use free_agent_gateway::providers::BoxedProvider;
 use free_agent_gateway::providers::openai_compatible::OpenAiCompatibleProvider;
 use free_agent_gateway::providers::traits::{ChatResponse, Provider, StreamResponse};
@@ -84,6 +84,7 @@ fn make_config() -> Config {
             provider_type: ProviderType::GithubModels,
             enabled: true,
             base_url: "https://models.inference.ai.azure.com".into(),
+            proxy_url: None,
             keys: vec!["key1".into(), "key2".into()],
             health_check_model: "openai/gpt-4.1-mini".into(),
             timeout_seconds: 30,
@@ -96,6 +97,7 @@ fn make_config() -> Config {
             provider_type: ProviderType::Nvidia,
             enabled: true,
             base_url: "https://integrate.api.nvidia.com/v1".into(),
+            proxy_url: None,
             keys: vec!["nvkey".into()],
             health_check_model: "meta/llama-3.1-70b-instruct".into(),
             timeout_seconds: 30,
@@ -108,6 +110,7 @@ fn make_config() -> Config {
             provider_type: ProviderType::Ollama,
             enabled: true,
             base_url: "http://localhost:11434".into(),
+            proxy_url: None,
             keys: vec!["ollama".into()],
             health_check_model: "qwen2.5:7b".into(),
             timeout_seconds: 120,
@@ -136,6 +139,8 @@ fn make_config() -> Config {
         watcher: Default::default(),
         state: Default::default(),
         cors: Default::default(),
+        adaptive_routing: Default::default(),
+        context_compression: Default::default(),
     }
 }
 
@@ -173,6 +178,10 @@ fn chat_request(model: &str, stream: bool) -> ChatCompletionRequest {
     }
 }
 
+fn sse(json: serde_json::Value) -> Bytes {
+    Bytes::from(format!("data: {}\n\n", json))
+}
+
 #[derive(Debug)]
 struct TestStreamProvider {
     name: String,
@@ -184,6 +193,175 @@ struct RecordingProvider {
     name: String,
     calls: Arc<Mutex<Vec<(String, String)>>>,
     fail_keys: Vec<String>,
+}
+
+#[derive(Debug)]
+struct StaticBodyProvider {
+    name: String,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+    body: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct StaticStreamProvider {
+    name: String,
+    chunks: Vec<Bytes>,
+}
+
+#[derive(Debug)]
+struct DiscoveryFailProvider {
+    name: String,
+}
+
+#[async_trait]
+impl Provider for DiscoveryFailProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "http://discovery-fail"
+    }
+
+    async fn list_models(&self, _api_key: &str) -> GatewayResult<Vec<String>> {
+        Err(GatewayError::UpstreamError(
+            "error decoding response body".into(),
+        ))
+    }
+
+    async fn chat(
+        &self,
+        _api_key: &str,
+        _request: ChatCompletionRequest,
+    ) -> GatewayResult<ChatResponse> {
+        unreachable!("discovery failure test should not reach chat")
+    }
+
+    async fn chat_stream(
+        &self,
+        _api_key: &str,
+        _request: ChatCompletionRequest,
+    ) -> GatewayResult<StreamResponse> {
+        unreachable!()
+    }
+
+    async fn health_check(&self, _api_key: &str) -> GatewayResult<u64> {
+        Ok(1)
+    }
+
+    fn health_check_model(&self) -> &str {
+        "working-model"
+    }
+
+    fn timeout_seconds(&self) -> u64 {
+        5
+    }
+
+    fn priority(&self) -> u32 {
+        0
+    }
+}
+
+#[async_trait]
+impl Provider for StaticBodyProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "http://static"
+    }
+
+    async fn list_models(&self, _api_key: &str) -> GatewayResult<Vec<String>> {
+        Ok(vec![])
+    }
+
+    async fn chat(
+        &self,
+        api_key: &str,
+        request: ChatCompletionRequest,
+    ) -> GatewayResult<ChatResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((self.name.clone(), format!("{api_key}:{}", request.model)));
+        Ok(ChatResponse {
+            body: self.body.clone(),
+            status: 200,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _api_key: &str,
+        _request: ChatCompletionRequest,
+    ) -> GatewayResult<StreamResponse> {
+        unreachable!()
+    }
+
+    async fn health_check(&self, _api_key: &str) -> GatewayResult<u64> {
+        Ok(1)
+    }
+
+    fn health_check_model(&self) -> &str {
+        "test-model"
+    }
+
+    fn timeout_seconds(&self) -> u64 {
+        5
+    }
+
+    fn priority(&self) -> u32 {
+        0
+    }
+}
+
+#[async_trait]
+impl Provider for StaticStreamProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "http://static-stream"
+    }
+
+    async fn list_models(&self, _api_key: &str) -> GatewayResult<Vec<String>> {
+        Ok(vec!["test-model".into()])
+    }
+
+    async fn chat(
+        &self,
+        _api_key: &str,
+        _request: ChatCompletionRequest,
+    ) -> GatewayResult<ChatResponse> {
+        unreachable!("stream provider does not serve non-stream chat")
+    }
+
+    async fn chat_stream(
+        &self,
+        _api_key: &str,
+        _request: ChatCompletionRequest,
+    ) -> GatewayResult<StreamResponse> {
+        let chunks = self.chunks.clone();
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+    }
+
+    async fn health_check(&self, _api_key: &str) -> GatewayResult<u64> {
+        Ok(1)
+    }
+
+    fn health_check_model(&self) -> &str {
+        "test-model"
+    }
+
+    fn timeout_seconds(&self) -> u64 {
+        5
+    }
+
+    fn priority(&self) -> u32 {
+        0
+    }
 }
 
 #[async_trait]
@@ -217,7 +395,92 @@ impl Provider for RecordingProvider {
             });
         }
         Ok(ChatResponse {
-            body: serde_json::json!({"id": "recorded"}),
+            body: serde_json::json!({
+                "id": "recorded",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok"
+                    }
+                }]
+            }),
+            status: 200,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _api_key: &str,
+        _request: ChatCompletionRequest,
+    ) -> GatewayResult<StreamResponse> {
+        unreachable!()
+    }
+
+    async fn health_check(&self, _api_key: &str) -> GatewayResult<u64> {
+        Ok(1)
+    }
+
+    fn health_check_model(&self) -> &str {
+        "wrong-fallback-model"
+    }
+
+    fn timeout_seconds(&self) -> u64 {
+        5
+    }
+
+    fn priority(&self) -> u32 {
+        0
+    }
+}
+
+#[derive(Debug)]
+struct FailingStatusProvider {
+    name: String,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+    fail_keys: Vec<String>,
+    fail_status: u16,
+}
+
+#[async_trait]
+impl Provider for FailingStatusProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "http://failing-status"
+    }
+
+    async fn list_models(&self, _api_key: &str) -> GatewayResult<Vec<String>> {
+        Ok(vec![])
+    }
+
+    async fn chat(
+        &self,
+        api_key: &str,
+        request: ChatCompletionRequest,
+    ) -> GatewayResult<ChatResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((api_key.to_string(), request.model.clone()));
+        if self.fail_keys.iter().any(|key| key == api_key) {
+            return Err(GatewayError::http_error(
+                self.fail_status,
+                "rate limit exceeded",
+                Some(60),
+            ));
+        }
+        Ok(ChatResponse {
+            body: serde_json::json!({
+                "id": "recorded",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok"
+                    }
+                }]
+            }),
             status: 200,
         })
     }
@@ -395,6 +658,7 @@ fn test_resolve_openrouter_free_model_preserves_suffix() {
         provider_type: ProviderType::OpenaiCompatible,
         enabled: true,
         base_url: "https://openrouter.ai/api/v1".into(),
+        proxy_url: None,
         keys: vec!["or-key".into()],
         health_check_model: "qwen/qwen3-coder:free".into(),
         timeout_seconds: 30,
@@ -470,6 +734,7 @@ async fn test_non_stream_request_falls_back_and_records_first_failure() {
                 provider_type: ProviderType::OpenaiCompatible,
                 enabled: true,
                 base_url,
+                proxy_url: None,
                 keys: vec![tiered_key(&format!("{name}-key"), KeyTier::Free)],
                 health_check_model: "test-model".into(),
                 timeout_seconds: 5,
@@ -505,6 +770,372 @@ async fn test_non_stream_request_falls_back_and_records_first_failure() {
         .remove(0);
     assert_eq!(first_state.fail_count, 1);
     assert_eq!(first_state.total_fail_count, 1);
+}
+
+#[tokio::test]
+async fn test_non_stream_empty_completion_falls_back() {
+    let mut config = make_config();
+    config.fallback = vec!["first".into(), "second".into()];
+    config.providers = HashMap::from([
+        (
+            "first".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenaiCompatible,
+                enabled: true,
+                base_url: "http://first".into(),
+                proxy_url: None,
+                keys: vec![tiered_key("first-key", KeyTier::Free)],
+                health_check_model: "test-model".into(),
+                timeout_seconds: 5,
+                priority: 0,
+            },
+        ),
+        (
+            "second".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenaiCompatible,
+                enabled: true,
+                base_url: "http://second".into(),
+                proxy_url: None,
+                keys: vec![tiered_key("second-key", KeyTier::Free)],
+                health_check_model: "test-model".into(),
+                timeout_seconds: 5,
+                priority: 0,
+            },
+        ),
+    ]);
+    let config = Arc::new(config);
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    for name in ["first", "second"] {
+        keyhub.register_provider(name, config.providers[name].keys.clone());
+        keyhub.update_models(name, &format!("{name}-key"), vec!["test-model".into()]);
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "first".into(),
+        Box::new(StaticBodyProvider {
+            name: "first".into(),
+            calls: calls.clone(),
+            body: serde_json::json!({
+                "id": "empty",
+                "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]
+            }),
+        }) as BoxedProvider,
+    );
+    providers.insert(
+        "second".into(),
+        Box::new(StaticBodyProvider {
+            name: "second".into(),
+            calls: calls.clone(),
+            body: serde_json::json!({
+                "id": "ok",
+                "choices": [{"message": {"role": "assistant", "content": "fallback ok"}, "finish_reason": "stop"}]
+            }),
+        }) as BoxedProvider,
+    );
+    let router = Router::new(
+        config,
+        providers,
+        keyhub,
+        Arc::new(RwLock::new(HashMap::new())),
+        None,
+    );
+
+    let response = router
+        .chat(&chat_request("test-model", false))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.body["choices"][0]["message"]["content"],
+        "fallback ok"
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, "first");
+    assert_eq!(calls[1].0, "second");
+}
+
+#[tokio::test]
+async fn test_model_discovery_failure_does_not_cooldown_key() {
+    let mut config = make_config();
+    config.fallback = vec!["opencode".into()];
+    config.providers = HashMap::from([(
+        "opencode".into(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenaiCompatible,
+            enabled: true,
+            base_url: "http://opencode".into(),
+            proxy_url: None,
+            keys: vec![tiered_key("opencode-key", KeyTier::Free)],
+            health_check_model: "working-model".into(),
+            timeout_seconds: 5,
+            priority: 0,
+        },
+    )]);
+    let config = Arc::new(config);
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "opencode".into(),
+        Box::new(DiscoveryFailProvider {
+            name: "opencode".into(),
+        }) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider("opencode", config.providers["opencode"].keys.clone());
+    let router = build_router(config, providers, keyhub.clone());
+
+    let result = router
+        .chat(&chat_request("opencode/some-model", false))
+        .await;
+
+    assert!(matches!(result, Err(GatewayError::ModelNotFound(_))));
+    let snapshot = keyhub.snapshot();
+    let key = snapshot
+        .iter()
+        .find(|(provider, _)| provider == "opencode")
+        .unwrap()
+        .1
+        .iter()
+        .find(|key| key.key_id == key_fingerprint("opencode-key"))
+        .unwrap();
+    assert_eq!(key.status, KeyStatus::Available);
+    assert_eq!(key.fail_count, 0);
+    assert_eq!(key.total_fail_count, 0);
+}
+
+#[tokio::test]
+async fn test_openrouter_free_model_uses_openrouter_key_without_inventory_cache() {
+    let mut config = make_config();
+    config.fallback = vec!["openrouter".into(), "nvidia".into()];
+    config.providers.insert(
+        "openrouter".into(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenaiCompatible,
+            enabled: true,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            proxy_url: None,
+            keys: vec![KeyConfig::detailed("or-key", KeyTier::Free)],
+            health_check_model: "google/gemma-4-31b-it:free".into(),
+            timeout_seconds: 30,
+            priority: 0,
+        },
+    );
+
+    let config = Arc::new(config);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "openrouter".into(),
+        Box::new(RecordingProvider {
+            name: "openrouter".into(),
+            calls: calls.clone(),
+            fail_keys: vec![],
+        }) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider(
+        "openrouter",
+        vec![KeyConfig::detailed("or-key", KeyTier::Free)],
+    );
+    let router = build_router(config, providers, keyhub);
+
+    let response = router
+        .chat(&chat_request("google/gemma-4-31b-it:free", false))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[(
+            "or-key".to_string(),
+            "google/gemma-4-31b-it:free".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_canonical_model_routes_to_openrouter_free_variant() {
+    let mut config = make_config();
+    config.fallback = vec!["openrouter".into()];
+    config.providers = HashMap::from([(
+        "openrouter".into(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenaiCompatible,
+            enabled: true,
+            base_url: "http://openrouter".into(),
+            proxy_url: None,
+            keys: vec![KeyConfig::detailed("or-free", KeyTier::Free)],
+            health_check_model: "google/gemma-4-31b-it:free".into(),
+            timeout_seconds: 5,
+            priority: 0,
+        },
+    )]);
+    let config = Arc::new(config);
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider("openrouter", config.providers["openrouter"].keys.clone());
+    keyhub.update_models(
+        "openrouter",
+        "or-free",
+        vec!["google/gemma-4-31b-it:free".into()],
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "openrouter".into(),
+        Box::new(RecordingProvider {
+            name: "openrouter".into(),
+            calls: calls.clone(),
+            fail_keys: vec![],
+        }) as BoxedProvider,
+    );
+    let router = Router::new(
+        config,
+        providers,
+        keyhub,
+        Arc::new(RwLock::new(HashMap::new())),
+        None,
+    );
+
+    router
+        .chat(&chat_request("google/gemma-4-31b-it", false))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[(
+            "or-free".to_string(),
+            "google/gemma-4-31b-it:free".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_openrouter_free_model_without_available_key_is_not_model_not_found() {
+    let mut config = make_config();
+    config.fallback = vec!["openrouter".into(), "nvidia".into()];
+    config.providers.insert(
+        "openrouter".into(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenaiCompatible,
+            enabled: true,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            proxy_url: None,
+            keys: vec![KeyConfig::detailed("or-key", KeyTier::Free)],
+            health_check_model: "google/gemma-4-31b-it:free".into(),
+            timeout_seconds: 30,
+            priority: 0,
+        },
+    );
+
+    let config = Arc::new(config);
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "openrouter".into(),
+        Box::new(RecordingProvider {
+            name: "openrouter".into(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_keys: vec![],
+        }) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider(
+        "openrouter",
+        vec![KeyConfig::detailed("or-key", KeyTier::Free)],
+    );
+    keyhub.report_failure_with_retry_after("openrouter", "or-key", 429, Some(60));
+    let router = build_router(config, providers, keyhub);
+
+    let result = router
+        .chat_stream(&chat_request("google/gemma-4-31b-it:free", true))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(GatewayError::NoAvailableKeys(provider)) if provider == "openrouter"
+    ));
+}
+
+#[tokio::test]
+async fn test_rate_limited_key_is_removed_and_next_key_takes_over() {
+    let mut config = make_config();
+    config.fallback = vec!["openrouter".into()];
+    config.providers.insert(
+        "openrouter".into(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenaiCompatible,
+            enabled: true,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            proxy_url: None,
+            keys: vec![
+                KeyConfig::detailed("limited-key", KeyTier::Free),
+                KeyConfig::detailed("healthy-key", KeyTier::Free),
+            ],
+            health_check_model: "google/gemma-4-31b-it:free".into(),
+            timeout_seconds: 30,
+            priority: 0,
+        },
+    );
+
+    let config = Arc::new(config);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "openrouter".into(),
+        Box::new(FailingStatusProvider {
+            name: "openrouter".into(),
+            calls: calls.clone(),
+            fail_keys: vec!["limited-key".into()],
+            fail_status: 429,
+        }) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider(
+        "openrouter",
+        vec![
+            KeyConfig::detailed("limited-key", KeyTier::Free),
+            KeyConfig::detailed("healthy-key", KeyTier::Free),
+        ],
+    );
+    let router = build_router(config, providers, keyhub.clone());
+
+    let response = router
+        .chat(&chat_request("google/gemma-4-31b-it:free", false))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[
+            (
+                "limited-key".to_string(),
+                "google/gemma-4-31b-it:free".to_string()
+            ),
+            (
+                "healthy-key".to_string(),
+                "google/gemma-4-31b-it:free".to_string()
+            )
+        ]
+    );
+    let snapshot = keyhub.snapshot();
+    let openrouter = snapshot
+        .iter()
+        .find(|(provider, _)| provider == "openrouter")
+        .map(|(_, keys)| keys)
+        .unwrap();
+    let limited = openrouter
+        .iter()
+        .find(|key| key.key_id == key_fingerprint("limited-key"))
+        .unwrap();
+    assert_eq!(
+        limited.status,
+        free_agent_gateway::models::KeyStatus::RateLimited
+    );
+    assert!(!keyhub.reserve_key("openrouter", "limited-key"));
 }
 
 #[tokio::test]
@@ -583,6 +1214,136 @@ async fn test_stream_body_error_records_failure_without_success() {
     assert_eq!(state.success_count, 0);
     assert_eq!(state.fail_count, 1);
     assert_eq!(state.total_fail_count, 1);
+    assert_eq!(state.status, KeyStatus::Cooldown);
+    assert!(!keyhub.reserve_key("streamer", "stream-key"));
+}
+
+#[tokio::test]
+async fn test_stream_fragmented_tool_call_arguments_success_records_success() {
+    let mut config = make_config();
+    config.fallback = vec!["streamer".into()];
+    config.models.insert(
+        "stream-test".into(),
+        ModelAlias {
+            provider: "streamer".into(),
+            model: "test-model".into(),
+        },
+    );
+    let config = Arc::new(config);
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "streamer".into(),
+        Box::new(StaticStreamProvider {
+            name: "streamer".into(),
+            chunks: vec![
+                sse(serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{\"city\""
+                                }
+                            }]
+                        }
+                    }]
+                })),
+                sse(serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "function": {
+                                    "arguments": ":\"Shanghai\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })),
+            ],
+        }) as free_agent_gateway::providers::BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider("streamer", vec![tiered_key("stream-key", KeyTier::Free)]);
+    keyhub.update_models("streamer", "stream-key", vec!["test-model".into()]);
+    let router = build_router(config, providers, keyhub.clone());
+
+    let results: Vec<_> = router
+        .chat_stream(&chat_request("stream-test", true))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    assert!(results.iter().all(Result::is_ok));
+    let state = keyhub.snapshot().remove(0).1.remove(0);
+    assert_eq!(state.success_count, 1);
+    assert_eq!(state.total_fail_count, 0);
+}
+
+#[tokio::test]
+async fn test_stream_incomplete_tool_call_arguments_records_failure() {
+    let mut config = make_config();
+    config.fallback = vec!["streamer".into()];
+    config.models.insert(
+        "stream-test".into(),
+        ModelAlias {
+            provider: "streamer".into(),
+            model: "test-model".into(),
+        },
+    );
+    let config = Arc::new(config);
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "streamer".into(),
+        Box::new(StaticStreamProvider {
+            name: "streamer".into(),
+            chunks: vec![
+                sse(serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{\"city\""
+                                }
+                            }]
+                        }
+                    }]
+                })),
+                sse(serde_json::json!({
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "tool_calls"
+                    }]
+                })),
+            ],
+        }) as free_agent_gateway::providers::BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider("streamer", vec![tiered_key("stream-key", KeyTier::Free)]);
+    keyhub.update_models("streamer", "stream-key", vec!["test-model".into()]);
+    let router = build_router(config, providers, keyhub.clone());
+
+    let results: Vec<_> = router
+        .chat_stream(&chat_request("stream-test", true))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    assert!(results.iter().any(Result::is_err));
+    let state = keyhub.snapshot().remove(0).1.remove(0);
+    assert_eq!(state.success_count, 0);
+    assert_eq!(state.total_fail_count, 1);
+    assert_eq!(state.status, KeyStatus::Cooldown);
 }
 
 #[tokio::test]
@@ -597,6 +1358,7 @@ async fn test_router_never_uses_paid_or_unknown_keys() {
             provider_type: ProviderType::OpenaiCompatible,
             enabled: true,
             base_url: "http://recording".into(),
+            proxy_url: None,
             keys: vec![
                 tiered_key("paid-key", KeyTier::Paid),
                 KeyConfig::Legacy("unknown-key".into()),
@@ -642,6 +1404,7 @@ async fn test_router_falls_back_across_free_keys_without_changing_model() {
                 provider_type: ProviderType::OpenaiCompatible,
                 enabled: true,
                 base_url: "http://recording".into(),
+                proxy_url: None,
                 keys: vec![tiered_key(&format!("{name}-key"), KeyTier::Free)],
                 health_check_model: format!("wrong-{name}"),
                 timeout_seconds: 5,
@@ -702,6 +1465,7 @@ async fn test_least_rate_prefers_less_used_key_across_providers() {
                 provider_type: ProviderType::OpenaiCompatible,
                 enabled: true,
                 base_url: "http://recording".into(),
+                proxy_url: None,
                 keys: vec![tiered_key(&format!("{name}-key"), KeyTier::Free)],
                 health_check_model: format!("wrong-{name}"),
                 timeout_seconds: 5,
@@ -755,6 +1519,7 @@ async fn test_round_robin_rotates_same_model_across_providers() {
                 provider_type: ProviderType::OpenaiCompatible,
                 enabled: true,
                 base_url: "http://recording".into(),
+                proxy_url: None,
                 keys: vec![tiered_key(&format!("{name}-key"), KeyTier::Free)],
                 health_check_model: format!("wrong-{name}"),
                 timeout_seconds: 5,

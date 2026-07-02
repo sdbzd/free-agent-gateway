@@ -1,5 +1,8 @@
 /// Admin endpoints: configuration management, provider testing, SSE events.
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,6 +17,9 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
+use crate::keyhub::key_fingerprint;
+use crate::metadata::ModelMetaStore;
+use crate::providers::traits::{ChatResponse, Provider};
 
 /// GET /admin/config — Return masked configuration.
 pub async fn admin_config_get(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -40,6 +46,7 @@ pub async fn admin_config_get(State(state): State<AppState>) -> Json<serde_json:
                 "type": format!("{:?}", pc.provider_type),
                 "enabled": pc.enabled,
                 "base_url": pc.base_url,
+                "proxy_url": pc.proxy_url,
                 "keys": masked_keys,
                 "keys_count": pc.keys.len(),
                 "health_check_model": pc.health_check_model,
@@ -72,6 +79,7 @@ pub async fn admin_config_get(State(state): State<AppState>) -> Json<serde_json:
             "interval_seconds": config.watcher.interval_seconds,
             "check_timeout_seconds": config.watcher.check_timeout_seconds,
         },
+        "adaptive_routing": config.adaptive_routing,
     }))
 }
 
@@ -377,6 +385,183 @@ pub async fn admin_provider_refresh(
 }
 
 /// POST /admin/providers/:name/test — Test a provider with a real chat completion.
+fn admin_test_model_candidates(
+    state: &AppState,
+    provider_name: &str,
+    api_key: Option<&str>,
+    key_id: Option<&str>,
+) -> Vec<String> {
+    let disabled = state
+        .disabled_models
+        .read()
+        .get(provider_name)
+        .cloned()
+        .unwrap_or_default();
+    let mut candidates = Vec::new();
+    if let Some(key_id) = key_id {
+        candidates.extend(state.keyhub.models_for_key_id(provider_name, key_id));
+    }
+    if let Some(api_key) = api_key {
+        candidates.extend(state.keyhub.models_for_key(provider_name, api_key));
+    }
+    if let Some(model) = state
+        .config
+        .providers
+        .get(provider_name)
+        .map(|pc| pc.health_check_model.trim())
+        .filter(|model| !model.is_empty())
+    {
+        candidates.push(model.to_string());
+    }
+    dedupe_enabled_models(candidates, &disabled)
+}
+
+fn dedupe_enabled_models(candidates: Vec<String>, disabled: &HashSet<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|model| !model.trim().is_empty())
+        .filter(|model| !disabled.contains(model))
+        .filter(|model| seen.insert(model.clone()))
+        .collect()
+}
+
+fn validation_test_request(model: &str) -> crate::models::ChatCompletionRequest {
+    crate::models::ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![crate::models::ChatMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String("Reply with OK".to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }],
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: Some(false),
+        stop: None,
+        max_tokens: Some(20),
+        presence_penalty: None,
+        frequency_penalty: None,
+        user: None,
+        request_id: None,
+        agent_name: None,
+        extra: serde_json::Map::new(),
+    }
+}
+
+async fn send_admin_probe(
+    provider: &dyn Provider,
+    api_key: &str,
+    model: &str,
+    timeout_dur: std::time::Duration,
+) -> Result<(ChatResponse, u64), crate::error::GatewayError> {
+    let started = Instant::now();
+    let request = validation_test_request(model);
+    let response = tokio::time::timeout(timeout_dur, provider.chat(api_key, request))
+        .await
+        .map_err(|_| crate::error::GatewayError::Timeout("admin validation timed out".into()))??;
+    Ok((response, started.elapsed().as_millis() as u64))
+}
+
+fn is_validation_model_mismatch(error: &crate::error::GatewayError) -> bool {
+    let status = error.http_status();
+    let message = error.to_string().to_lowercase();
+    status == 404
+        || (status == 403
+            && (message.contains("not available in your region")
+                || message.contains("model is not available")
+                || message.contains("model not available")
+                || message.contains("model_not_found")))
+}
+
+fn validation_error_should_update_key_state(error: &crate::error::GatewayError) -> bool {
+    error.http_status() == 429 || error.is_auth_failure()
+}
+
+fn validation_failure_status(error: &crate::error::GatewayError) -> &'static str {
+    if validation_error_should_update_key_state(error) {
+        "key_limited_or_invalid"
+    } else {
+        "inconclusive"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_admin_validation_attempt(
+    model_meta: &Option<ModelMetaStore>,
+    request_id: &str,
+    attempt_index: i64,
+    provider_name: &str,
+    model: &str,
+    api_key: &str,
+    result: Result<u16, &crate::error::GatewayError>,
+    fallback: bool,
+) {
+    let Some(meta) = model_meta else {
+        return;
+    };
+    let (success, category, status, message, cooldown_seconds) = match result {
+        Ok(status) => (true, "success", Some(status), None, None),
+        Err(error) => (
+            false,
+            error.category(),
+            Some(error.http_status()),
+            Some(error.to_string()),
+            error.retry_after_seconds().map(|seconds| seconds as i64),
+        ),
+    };
+    if let Err(error) = meta.record_request_attempt(
+        request_id,
+        attempt_index,
+        provider_name,
+        model,
+        &key_fingerprint(api_key),
+        success,
+        category,
+        status,
+        message.as_deref(),
+        cooldown_seconds,
+        fallback,
+    ) {
+        tracing::warn!(
+            request_id,
+            provider = %provider_name,
+            model,
+            error = %crate::error::sanitize_diagnostic(&error.to_string()),
+            "Failed to record admin validation attempt"
+        );
+    }
+}
+
+fn response_model_and_preview(
+    body: &serde_json::Value,
+    fallback_model: &str,
+) -> (String, Option<String>) {
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_model)
+        .to_string();
+    let content_preview = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            if s.len() > 100 {
+                format!("{}...", &s[..100])
+            } else {
+                s.to_string()
+            }
+        });
+    (model, content_preview)
+}
+
 pub async fn admin_provider_test(
     State(state): State<AppState>,
     Path(provider_name): Path<String>,
@@ -408,40 +593,6 @@ pub async fn admin_provider_test(
         }));
     }
 
-    // Get the health check model
-    let test_model = state
-        .config
-        .providers
-        .get(&provider_name)
-        .map(|pc| pc.health_check_model.clone())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
-
-    // Create a minimal test request
-    let test_request = crate::models::ChatCompletionRequest {
-        model: test_model.clone(),
-        messages: vec![crate::models::ChatMessage {
-            role: "user".to_string(),
-            content: serde_json::Value::String("Reply with OK".to_string()),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            extra: serde_json::Map::new(),
-        }],
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: Some(false),
-        stop: None,
-        max_tokens: Some(20),
-        presence_penalty: None,
-        frequency_penalty: None,
-        user: None,
-        request_id: None,
-        agent_name: None,
-        extra: serde_json::Map::new(),
-    };
-
-    let started = Instant::now();
     let timeout_dur = std::time::Duration::from_secs(
         state
             .config
@@ -450,76 +601,125 @@ pub async fn admin_provider_test(
             .map(|pc| pc.timeout_seconds)
             .unwrap_or(30),
     );
+    let candidates = admin_test_model_candidates(&state, &provider_name, Some(&api_key), None);
+    let validation_request_id = format!(
+        "admin-test-{}-{}",
+        provider_name,
+        chrono::Utc::now().timestamp_millis()
+    );
+    let mut skipped_models = Vec::new();
+    for (attempt_index, test_model) in candidates.iter().enumerate() {
+        match send_admin_probe(provider.as_ref(), &api_key, test_model, timeout_dur).await {
+            Ok((response, latency)) => {
+                record_admin_validation_attempt(
+                    &state.model_meta,
+                    &validation_request_id,
+                    (attempt_index + 1) as i64,
+                    &provider_name,
+                    test_model,
+                    &api_key,
+                    Ok(response.status),
+                    false,
+                );
+                state
+                    .keyhub
+                    .report_reserved_success(&provider_name, &api_key, None, None);
 
-    let result = tokio::time::timeout(timeout_dur, provider.chat(&api_key, test_request)).await;
+                let _ = state.sse_tx.send(
+                    json!({
+                        "type": "provider_test",
+                        "data": { "provider": &provider_name, "success": true, "latency_ms": latency, "model": test_model },
+                        "timestamp": chrono::Utc::now().timestamp(),
+                    })
+                    .to_string(),
+                );
 
-    match result {
-        Ok(Ok(response)) => {
-            let latency = started.elapsed().as_millis() as u64;
-            state
-                .keyhub
-                .report_reserved_success(&provider_name, &api_key, None, None);
-
-            // Broadcast event
-            let _ = state.sse_tx.send(
-                json!({
-                    "type": "provider_test",
-                    "data": { "provider": &provider_name, "success": true, "latency_ms": latency },
-                    "timestamp": chrono::Utc::now().timestamp(),
-                })
-                .to_string(),
-            );
-
-            let body = &response.body;
-            let model = body
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&test_model)
-                .to_string();
-            let content_preview = body
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    if s.len() > 100 {
-                        format!("{}...", &s[..100])
-                    } else {
-                        s.to_string()
-                    }
-                });
-
-            Json(json!({
-                "success": true,
-                "provider": provider_name,
-                "model": model,
-                "latency_ms": latency,
-                "status": response.status,
-                "response_preview": content_preview,
-            }))
+                let (model, content_preview) =
+                    response_model_and_preview(&response.body, test_model);
+                return Json(json!({
+                    "success": true,
+                    "provider": provider_name,
+                    "model": model,
+                    "attempted_models": candidates,
+                    "skipped_models": skipped_models,
+                    "latency_ms": latency,
+                    "status": response.status,
+                    "response_preview": content_preview,
+                }));
+            }
+            Err(e) if is_validation_model_mismatch(&e) => {
+                record_admin_validation_attempt(
+                    &state.model_meta,
+                    &validation_request_id,
+                    (attempt_index + 1) as i64,
+                    &provider_name,
+                    test_model,
+                    &api_key,
+                    Err(&e),
+                    attempt_index + 1 < candidates.len(),
+                );
+                skipped_models.push(json!({
+                    "model": test_model,
+                    "http_status": e.http_status(),
+                    "error": e.to_string(),
+                }));
+                continue;
+            }
+            Err(e) => {
+                record_admin_validation_attempt(
+                    &state.model_meta,
+                    &validation_request_id,
+                    (attempt_index + 1) as i64,
+                    &provider_name,
+                    test_model,
+                    &api_key,
+                    Err(&e),
+                    false,
+                );
+                let status = e.http_status();
+                let key_state_updated = validation_error_should_update_key_state(&e);
+                if validation_error_should_update_key_state(&e) {
+                    state
+                        .keyhub
+                        .report_gateway_error(&provider_name, &api_key, &e);
+                }
+                return Json(json!({
+                    "success": false,
+                    "provider": provider_name,
+                    "model": test_model,
+                    "attempted_models": candidates,
+                    "skipped_models": skipped_models,
+                    "error": e.to_string(),
+                    "http_status": status,
+                    "validation_status": validation_failure_status(&e),
+                    "key_state_updated": key_state_updated,
+                }));
+            }
         }
-        Ok(Err(e)) => {
-            let latency = started.elapsed().as_millis() as u64;
-            let status = e.http_status();
-            state
-                .keyhub
-                .report_gateway_error(&provider_name, &api_key, &e);
-            Json(json!({
-                "success": false,
-                "provider": provider_name,
-                "latency_ms": latency,
-                "error": e.to_string(),
-                "http_status": status,
-            }))
-        }
-        Err(_) => Json(json!({
+    }
+
+    if let Some(last) = skipped_models.last() {
+        Json(json!({
             "success": false,
             "provider": provider_name,
-            "error": "Request timed out",
-            "latency_ms": started.elapsed().as_millis() as u64,
-        })),
+            "attempted_models": candidates,
+            "skipped_models": skipped_models,
+            "error": last.get("error").cloned().unwrap_or_else(|| json!("No validation model succeeded")),
+            "http_status": last.get("http_status").cloned().unwrap_or_else(|| json!(400)),
+        }))
+    } else {
+        let e = crate::error::GatewayError::InvalidRequest(
+            "No enabled validation models available".into(),
+        );
+        state
+            .keyhub
+            .report_gateway_error(&provider_name, &api_key, &e);
+        Json(json!({
+            "success": false,
+            "provider": provider_name,
+            "error": e.to_string(),
+            "http_status": e.http_status(),
+        }))
     }
 }
 
@@ -789,6 +989,178 @@ pub async fn admin_provider_key_restore(
     }
 }
 
+/// POST /admin/providers/{name}/keys/{key_id}/validate — Validate one key with a real chat request.
+pub async fn admin_provider_key_validate(
+    State(state): State<AppState>,
+    Path((provider_name, key_id)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    let provider = match state.providers.get(&provider_name) {
+        Some(p) => p,
+        None => {
+            return Json(json!({
+                "success": false,
+                "provider": provider_name,
+                "key_id": key_id,
+                "error": format!("Provider '{}' not found", provider_name),
+            }));
+        }
+    };
+
+    let api_key = match state.keyhub.key_by_id(&provider_name, &key_id) {
+        Ok(key) => key,
+        Err(error) => {
+            return Json(json!({
+                "success": false,
+                "provider": provider_name,
+                "key_id": key_id,
+                "error": error.to_string(),
+            }));
+        }
+    };
+
+    let timeout_dur = std::time::Duration::from_secs(
+        state
+            .config
+            .providers
+            .get(&provider_name)
+            .map(|pc| pc.timeout_seconds)
+            .unwrap_or(30)
+            .clamp(5, 60),
+    );
+    let candidates =
+        admin_test_model_candidates(&state, &provider_name, Some(&api_key), Some(&key_id));
+    let validation_request_id = format!(
+        "admin-validate-{}-{}-{}",
+        provider_name,
+        key_id,
+        chrono::Utc::now().timestamp_millis()
+    );
+    let mut skipped_models = Vec::new();
+    for (attempt_index, test_model) in candidates.iter().enumerate() {
+        match send_admin_probe(provider.as_ref(), &api_key, test_model, timeout_dur).await {
+            Ok((response, latency)) => {
+                record_admin_validation_attempt(
+                    &state.model_meta,
+                    &validation_request_id,
+                    (attempt_index + 1) as i64,
+                    &provider_name,
+                    test_model,
+                    &api_key,
+                    Ok(response.status),
+                    false,
+                );
+                state
+                    .keyhub
+                    .report_success(&provider_name, &api_key, None, None);
+
+                let _ = state.sse_tx.send(
+                    json!({
+                        "type": "key_validate",
+                        "data": {
+                            "provider": &provider_name,
+                            "key_id": &key_id,
+                            "success": true,
+                            "latency_ms": latency,
+                            "model": test_model,
+                        },
+                        "timestamp": chrono::Utc::now().timestamp(),
+                    })
+                    .to_string(),
+                );
+
+                let (model, content_preview) =
+                    response_model_and_preview(&response.body, test_model);
+                return Json(json!({
+                    "success": true,
+                    "provider": provider_name,
+                    "key_id": key_id,
+                    "model": model,
+                    "attempted_models": candidates,
+                    "skipped_models": skipped_models,
+                    "latency_ms": latency,
+                    "status": response.status,
+                    "response_preview": content_preview,
+                }));
+            }
+            Err(error) if is_validation_model_mismatch(&error) => {
+                record_admin_validation_attempt(
+                    &state.model_meta,
+                    &validation_request_id,
+                    (attempt_index + 1) as i64,
+                    &provider_name,
+                    test_model,
+                    &api_key,
+                    Err(&error),
+                    attempt_index + 1 < candidates.len(),
+                );
+                skipped_models.push(json!({
+                    "model": test_model,
+                    "http_status": error.http_status(),
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
+            Err(error) => {
+                record_admin_validation_attempt(
+                    &state.model_meta,
+                    &validation_request_id,
+                    (attempt_index + 1) as i64,
+                    &provider_name,
+                    test_model,
+                    &api_key,
+                    Err(&error),
+                    false,
+                );
+                let status = error.http_status();
+                let key_state_updated = validation_error_should_update_key_state(&error);
+                if validation_error_should_update_key_state(&error) {
+                    state
+                        .keyhub
+                        .report_gateway_error(&provider_name, &api_key, &error);
+                }
+                return Json(json!({
+                    "success": false,
+                    "provider": provider_name,
+                    "key_id": key_id,
+                    "model": test_model,
+                    "attempted_models": candidates,
+                    "skipped_models": skipped_models,
+                    "error": error.to_string(),
+                    "http_status": status,
+                    "validation_status": validation_failure_status(&error),
+                    "key_state_updated": key_state_updated,
+                }));
+            }
+        }
+    }
+
+    if let Some(last) = skipped_models.last() {
+        Json(json!({
+            "success": false,
+            "provider": provider_name,
+            "key_id": key_id,
+            "attempted_models": candidates,
+            "skipped_models": skipped_models,
+            "error": last.get("error").cloned().unwrap_or_else(|| json!("No validation model succeeded")),
+            "http_status": last.get("http_status").cloned().unwrap_or_else(|| json!(400)),
+        }))
+    } else {
+        let error = crate::error::GatewayError::InvalidRequest(
+            "No enabled validation models available".into(),
+        );
+        state
+            .keyhub
+            .report_gateway_error(&provider_name, &api_key, &error);
+        Json(json!({
+            "success": false,
+            "provider": provider_name,
+            "key_id": key_id,
+            "error": error.to_string(),
+            "http_status": error.http_status(),
+        }))
+    }
+}
+
 /// POST /admin/save — Persist current state (disabled_models, keyhub states) to state.json.
 pub async fn admin_save(State(state): State<AppState>) -> Json<serde_json::Value> {
     let keyhub_snapshot = state.keyhub.snapshot();
@@ -919,6 +1291,10 @@ fn key_rate_usage_json(k: &crate::models::KeyState) -> serde_json::Value {
     let now_secs = chrono::Utc::now().timestamp() as u64;
     let now_min = now_secs / 60;
     let now_day = now_secs / 86400;
+    let blocked_by_status = matches!(
+        k.status,
+        crate::models::KeyStatus::RateLimited | crate::models::KeyStatus::Cooldown
+    );
     let rpm_used = if k.rpm_window_start == now_min {
         k.rpm_count
     } else {
@@ -979,12 +1355,30 @@ fn key_rate_usage_json(k: &crate::models::KeyState) -> serde_json::Value {
         );
     }
 
+    let display_percent = if blocked_by_status {
+        Some(100.0)
+    } else if constrained {
+        Some(max_percent)
+    } else {
+        None
+    };
+    let exhausted_for_display = exhausted || blocked_by_status;
+
     json!({
         "axes": axis_json,
         "constrained": constrained,
-        "exhausted": exhausted,
+        "exhausted": exhausted_for_display,
+        "counter_exhausted": exhausted,
+        "blocked_by_status": blocked_by_status,
+        "display_percent": display_percent,
         "max_percent": if constrained { Some(max_percent) } else { None },
-        "headroom_percent": if constrained { Some((100.0 - max_percent).max(0.0)) } else { None },
+        "headroom_percent": if blocked_by_status {
+            Some(0.0)
+        } else if constrained {
+            Some((100.0 - max_percent).max(0.0))
+        } else {
+            None
+        },
     })
 }
 
@@ -1096,6 +1490,342 @@ pub async fn admin_metadata_models(State(state): State<AppState>) -> Json<serde_
 }
 
 /// GET /admin/metadata/usage — Usage summary. Defaults to all known history.
+#[derive(serde::Deserialize)]
+pub struct AttemptsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttemptCategorySummary {
+    pub category: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttemptDeploymentSummary {
+    pub deployment: String,
+    pub provider: String,
+    pub model_id: String,
+    pub key_id: String,
+    pub attempts: usize,
+    pub failures: usize,
+    pub last_error_category: Option<String>,
+    pub last_http_status: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttemptRoutingAnalysis {
+    pub total_attempts: usize,
+    pub successful_attempts: usize,
+    pub failed_attempts: usize,
+    pub fallback_attempts: usize,
+    pub top_error_categories: Vec<AttemptCategorySummary>,
+    pub hot_deployments: Vec<AttemptDeploymentSummary>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AttemptAnalysisQuery {
+    limit: Option<i64>,
+    #[serde(default)]
+    use_model: bool,
+    model: Option<String>,
+}
+
+pub fn summarize_attempts_for_routing(
+    attempts: &[crate::metadata::RequestAttemptRow],
+) -> AttemptRoutingAnalysis {
+    let mut category_counts: HashMap<String, usize> = HashMap::new();
+    let mut deployments: HashMap<String, AttemptDeploymentSummary> = HashMap::new();
+    let mut provider_model_errors: HashMap<(String, String, String), HashSet<String>> =
+        HashMap::new();
+    let mut successful_attempts = 0;
+    let mut fallback_attempts = 0;
+
+    for attempt in attempts {
+        if attempt.success {
+            successful_attempts += 1;
+        } else if let Some(category) = attempt.error_category.as_deref() {
+            *category_counts.entry(category.to_string()).or_default() += 1;
+            provider_model_errors
+                .entry((
+                    attempt.provider.clone(),
+                    attempt.model_id.clone(),
+                    category.to_string(),
+                ))
+                .or_default()
+                .insert(attempt.key_id.clone());
+        }
+        if attempt.fallback {
+            fallback_attempts += 1;
+        }
+
+        let deployment = format!(
+            "{}/{}/{}",
+            attempt.provider, attempt.model_id, attempt.key_id
+        );
+        let entry =
+            deployments
+                .entry(deployment.clone())
+                .or_insert_with(|| AttemptDeploymentSummary {
+                    deployment,
+                    provider: attempt.provider.clone(),
+                    model_id: attempt.model_id.clone(),
+                    key_id: attempt.key_id.clone(),
+                    attempts: 0,
+                    failures: 0,
+                    last_error_category: None,
+                    last_http_status: None,
+                });
+        entry.attempts += 1;
+        if !attempt.success {
+            entry.failures += 1;
+            entry.last_error_category = attempt.error_category.clone();
+            entry.last_http_status = attempt.http_status;
+        }
+    }
+
+    let mut top_error_categories: Vec<_> = category_counts
+        .into_iter()
+        .map(|(category, count)| AttemptCategorySummary { category, count })
+        .collect();
+    top_error_categories.sort_by(|a, b| b.count.cmp(&a.count).then(a.category.cmp(&b.category)));
+
+    let mut hot_deployments: Vec<_> = deployments
+        .into_values()
+        .filter(|deployment| deployment.failures > 0)
+        .collect();
+    hot_deployments.sort_by(|a, b| {
+        b.failures
+            .cmp(&a.failures)
+            .then(b.attempts.cmp(&a.attempts))
+            .then(a.deployment.cmp(&b.deployment))
+    });
+    hot_deployments.truncate(10);
+
+    let mut recommendations = Vec::new();
+    let mut saturated: Vec<_> = provider_model_errors
+        .into_iter()
+        .filter(|((_, _, category), key_ids)| category == "rate_limited" && key_ids.len() >= 2)
+        .collect();
+    saturated.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then(a.0.0.cmp(&b.0.0))
+            .then(a.0.1.cmp(&b.0.1))
+    });
+    for ((provider, model_id, _category), key_ids) in saturated.into_iter().take(5) {
+        recommendations.push(format!(
+            "{provider}/{model_id} has {} independent account keys rate-limited in the sample; switch provider/model family first, then add more independent accounts if this model must stay primary",
+            key_ids.len()
+        ));
+    }
+    for deployment in &hot_deployments {
+        match deployment.last_error_category.as_deref() {
+            Some("rate_limited") => recommendations.push(format!(
+                "{} should stay in cooldown/probing until a successful half-open request proves recovery",
+                deployment.deployment
+            )),
+            Some("upstream_error" | "malformed_stream" | "empty_response") => {
+                recommendations.push(format!(
+                    "{} should be deprioritized and retried only after healthier deployments",
+                    deployment.deployment
+                ));
+            }
+            Some("region_forbidden" | "model_forbidden") => recommendations.push(format!(
+                "{} should be treated as model/provider access restricted, not generic key exhaustion",
+                deployment.deployment
+            )),
+            Some("auth_failed") => recommendations.push(format!(
+                "{} should be disabled until credentials are manually fixed",
+                deployment.deployment
+            )),
+            _ => recommendations.push(format!(
+                "{} needs more evidence before changing global routing",
+                deployment.deployment
+            )),
+        }
+    }
+    if recommendations.is_empty() {
+        recommendations.push(
+            "No failing deployments in the sampled attempts; keep routing by quota headroom and latency"
+                .to_string(),
+        );
+    }
+
+    AttemptRoutingAnalysis {
+        total_attempts: attempts.len(),
+        successful_attempts,
+        failed_attempts: attempts.len().saturating_sub(successful_attempts),
+        fallback_attempts,
+        top_error_categories,
+        hot_deployments,
+        recommendations,
+    }
+}
+
+pub fn build_attempt_analysis_prompt(
+    attempts: &[crate::metadata::RequestAttemptRow],
+    limit: i64,
+) -> String {
+    let mut lines = vec![
+        "You are analyzing free LLM gateway routing logs.".to_string(),
+        "This diagnostic model call is a real upstream request and consumes the same key/provider quota budget as user traffic.".to_string(),
+        "Keys below are stable fingerprints, not raw secrets.".to_string(),
+        format!("Analyze the newest {limit} routing attempts and recommend cooldown, probing, provider preference, and model fallback changes."),
+        "Return concise JSON with: findings, likely_root_causes, routing_actions, confidence.".to_string(),
+        String::new(),
+    ];
+    for attempt in attempts.iter().take(limit as usize) {
+        lines.push(format!(
+            "request_id={} attempt={} provider={} model={} key_id={} success={} category={} status={} fallback={} cooldown_s={}",
+            attempt.request_id,
+            attempt.attempt_index,
+            attempt.provider,
+            attempt.model_id,
+            attempt.key_id,
+            attempt.success,
+            attempt.error_category.as_deref().unwrap_or("success"),
+            attempt
+                .http_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            attempt.fallback,
+            attempt
+                .cooldown_seconds
+                .map(|seconds| seconds.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ));
+    }
+    lines.join("\n")
+}
+
+/// GET /admin/metadata/attempts - Recent structured routing attempts.
+pub async fn admin_metadata_attempts(
+    State(state): State<AppState>,
+    Query(query): Query<AttemptsQuery>,
+) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "attempts": [], "total": 0 }));
+    };
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    match meta.get_recent_attempts(limit) {
+        Ok(attempts) => Json(json!({
+            "attempts": attempts,
+            "total": attempts.len(),
+            "limit": limit,
+        })),
+        Err(e) => Json(json!({ "error": e.to_string(), "attempts": [], "total": 0 })),
+    }
+}
+
+/// GET /admin/metadata/attempts/analyze - Analyze recent routing attempts locally or with a model.
+pub async fn admin_metadata_attempts_analyze(
+    State(state): State<AppState>,
+    Query(query): Query<AttemptAnalysisQuery>,
+) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({
+            "analysis": summarize_attempts_for_routing(&[]),
+            "attempts": [],
+            "total": 0,
+            "model_analysis": null,
+        }));
+    };
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let attempts = match meta.get_recent_attempts(limit) {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            return Json(json!({
+                "error": error.to_string(),
+                "analysis": summarize_attempts_for_routing(&[]),
+                "attempts": [],
+                "total": 0,
+                "model_analysis": null,
+            }));
+        }
+    };
+    let analysis = summarize_attempts_for_routing(&attempts);
+
+    if !query.use_model {
+        return Json(json!({
+            "analysis": analysis,
+            "attempts": attempts,
+            "total": attempts.len(),
+            "limit": limit,
+            "model_analysis": null,
+            "model_call_costs_quota": false,
+        }));
+    }
+
+    let model = query.model.unwrap_or_else(|| "chat".to_string());
+    let prompt = build_attempt_analysis_prompt(&attempts, limit);
+    let request = crate::models::ChatCompletionRequest {
+        model: model.clone(),
+        messages: vec![crate::models::ChatMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(prompt),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }],
+        temperature: Some(0.1),
+        top_p: None,
+        n: None,
+        stream: Some(false),
+        stop: None,
+        max_tokens: Some(700),
+        presence_penalty: None,
+        frequency_penalty: None,
+        user: Some("admin-log-analysis".to_string()),
+        request_id: Some(format!("admin-log-analysis-{}", uuid::Uuid::new_v4())),
+        agent_name: Some("admin".to_string()),
+        extra: serde_json::Map::new(),
+    };
+
+    match state.router.chat(&request).await {
+        Ok(response) => Json(json!({
+            "analysis": analysis,
+            "attempts": attempts,
+            "total": attempts.len(),
+            "limit": limit,
+            "model_analysis": crate::models::content_to_text(
+                &response.body["choices"][0]["message"]["content"]
+            ),
+            "model": model,
+            "model_call_costs_quota": true,
+        })),
+        Err(error) => Json(json!({
+            "analysis": analysis,
+            "attempts": attempts,
+            "total": attempts.len(),
+            "limit": limit,
+            "model_analysis": null,
+            "model": model,
+            "model_call_costs_quota": true,
+            "model_error": error.to_string(),
+        })),
+    }
+}
+
+/// GET /admin/metadata/deployments - Provider/model/key health learned from attempts.
+pub async fn admin_metadata_deployments(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "deployments": [], "total": 0 }));
+    };
+
+    match meta.get_deployment_states() {
+        Ok(deployments) => Json(json!({
+            "deployments": deployments,
+            "total": deployments.len(),
+        })),
+        Err(e) => Json(json!({ "error": e.to_string(), "deployments": [], "total": 0 })),
+    }
+}
+
 pub async fn admin_metadata_usage(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
@@ -1114,39 +1844,297 @@ pub async fn admin_metadata_usage(
             let total_requests: i64 = rows.iter().map(|u| u.total_requests).sum();
             let total_prompt_tokens: i64 = rows.iter().map(|u| u.total_prompt_tokens).sum();
             let total_completion_tokens: i64 = rows.iter().map(|u| u.total_completion_tokens).sum();
+            let reported_prompt_tokens: i64 = rows.iter().map(|u| u.reported_prompt_tokens).sum();
+            let reported_completion_tokens: i64 =
+                rows.iter().map(|u| u.reported_completion_tokens).sum();
+            let estimated_prompt_tokens: i64 = rows.iter().map(|u| u.estimated_prompt_tokens).sum();
+            let estimated_completion_tokens: i64 =
+                rows.iter().map(|u| u.estimated_completion_tokens).sum();
             let total_success: i64 = rows.iter().map(|u| u.total_success).sum();
             let total_errors: i64 = rows.iter().map(|u| u.total_errors).sum();
+            let token_reported_requests: i64 = rows.iter().map(|u| u.token_reported_requests).sum();
+            let token_estimated_requests = total_requests.saturating_sub(token_reported_requests);
             let usage: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|u| {
+                    let token_reporting_coverage = if u.total_requests > 0 {
+                        Some(u.token_reported_requests as f64 / u.total_requests as f64)
+                    } else {
+                        None
+                    };
                     json!({
                         "provider": u.provider,
                         "model_id": u.model_id,
                         "total_requests": u.total_requests,
                         "total_prompt_tokens": u.total_prompt_tokens,
                         "total_completion_tokens": u.total_completion_tokens,
+                        "reported_prompt_tokens": u.reported_prompt_tokens,
+                        "reported_completion_tokens": u.reported_completion_tokens,
+                        "reported_tokens": u.reported_prompt_tokens + u.reported_completion_tokens,
+                        "estimated_prompt_tokens": u.estimated_prompt_tokens,
+                        "estimated_completion_tokens": u.estimated_completion_tokens,
+                        "estimated_tokens": u.estimated_prompt_tokens + u.estimated_completion_tokens,
+                        "token_reported_requests": u.token_reported_requests,
+                        "token_estimated_requests": u.total_requests.saturating_sub(u.token_reported_requests),
+                        "token_reporting_coverage": token_reporting_coverage,
                         "total_success": u.total_success,
                         "total_errors": u.total_errors,
                         "last_used_at": u.last_used_at,
                     })
                 })
                 .collect();
+            let lifetime = meta.get_usage_lifetime().ok();
             Json(json!({
                 "usage": usage,
                 "total": usage.len(),
+                "lifetime": lifetime,
                 "summary": {
                     "window_days": if days > 0 { serde_json::Value::from(days) } else { serde_json::Value::Null },
                     "total_requests": total_requests,
                     "total_prompt_tokens": total_prompt_tokens,
                     "total_completion_tokens": total_completion_tokens,
                     "total_tokens": total_prompt_tokens + total_completion_tokens,
+                    "reported_prompt_tokens": reported_prompt_tokens,
+                    "reported_completion_tokens": reported_completion_tokens,
+                    "reported_tokens": reported_prompt_tokens + reported_completion_tokens,
+                    "estimated_prompt_tokens": estimated_prompt_tokens,
+                    "estimated_completion_tokens": estimated_completion_tokens,
+                    "estimated_tokens": estimated_prompt_tokens + estimated_completion_tokens,
                     "total_success": total_success,
                     "total_errors": total_errors,
+                    "token_reported_requests": token_reported_requests,
+                    "token_estimated_requests": token_estimated_requests,
+                    "token_reporting_coverage": if total_requests > 0 { serde_json::Value::from(token_reported_requests as f64 / total_requests as f64) } else { serde_json::Value::Null },
+                    "token_source_note": "reported_tokens come from upstream usage fields; estimated_tokens are local approximations",
                 }
             }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
+}
+
+/// GET /admin/metadata/tasks — Adaptive routing task performance summary.
+/// GET /admin/metadata/usage/daily — Dense daily usage buckets.
+pub async fn admin_metadata_usage_daily(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "days": [], "total": 0 }));
+    };
+
+    let days = query
+        .get("days")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(7)
+        .clamp(1, 366);
+
+    match meta.get_usage_daily_summary(days) {
+        Ok(rows) => Json(json!({
+            "days": rows,
+            "total": rows.len(),
+            "window_days": days,
+        })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /admin/metadata/usage/hourly — Dense hourly usage buckets.
+pub async fn admin_metadata_usage_hourly(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "hours": [], "total": 0 }));
+    };
+
+    let hours = query
+        .get("hours")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(24)
+        .clamp(1, 24 * 366);
+
+    match meta.get_usage_hourly_summary(hours) {
+        Ok(rows) => Json(json!({
+            "hours": rows,
+            "total": rows.len(),
+            "window_hours": hours,
+        })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /admin/metadata/usage/lifetime — All-time aggregate usage totals.
+pub async fn admin_metadata_usage_lifetime(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "lifetime": null }));
+    };
+
+    match meta.get_usage_lifetime() {
+        Ok(lifetime) => Json(json!({ "lifetime": lifetime })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+pub async fn admin_metadata_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "tasks": [], "total": 0 }));
+    };
+
+    let days = query
+        .get("days")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(state.config.adaptive_routing.learning_window_days);
+
+    match meta.get_task_stats_summary(days) {
+        Ok(rows) => {
+            let tasks: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let success_rate = if row.request_count > 0 {
+                        Some(row.success_count as f64 / row.request_count as f64)
+                    } else {
+                        None
+                    };
+                    let avg_latency_ms = if row.request_count > 0 {
+                        Some(row.total_latency_ms / row.request_count)
+                    } else {
+                        None
+                    };
+                    json!({
+                        "provider": row.provider,
+                        "model_id": row.model_id,
+                        "agent": row.agent,
+                        "task_kind": row.task_kind,
+                        "request_count": row.request_count,
+                        "success_count": row.success_count,
+                        "error_count": row.error_count,
+                        "success_rate": success_rate,
+                        "avg_latency_ms": avg_latency_ms,
+                        "prompt_tokens": row.prompt_tokens,
+                        "completion_tokens": row.completion_tokens,
+                        "last_used_at": row.last_used_at,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "tasks": tasks,
+                "total": tasks.len(),
+                "window_days": days,
+            }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /admin/metadata/capabilities — Learned model capability observations.
+pub async fn admin_metadata_capabilities(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let Some(ref meta) = state.model_meta else {
+        return Json(json!({ "capabilities": [], "total": 0 }));
+    };
+
+    match meta.get_capability_observation_summary() {
+        Ok(rows) => {
+            let capabilities: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "provider": row.provider,
+                        "model_id": row.model_id,
+                        "capability": row.capability,
+                        "outcome": row.outcome,
+                        "count": row.count,
+                        "last_observed_at": row.last_observed_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "capabilities": capabilities, "total": capabilities.len() }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /admin/routing/adaptive — Explain adaptive routing for a synthetic request.
+pub async fn admin_adaptive_routing_diagnostics(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let model = query
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| "auto".to_string());
+    let content = query
+        .get("q")
+        .cloned()
+        .unwrap_or_else(|| "diagnose adaptive route".to_string());
+    let agent = query.get("agent").cloned();
+    let scope = if let Some(provider) = query.get("provider") {
+        crate::adaptive::AdaptiveScope::Provider(provider.clone())
+    } else if let Some(group) = query.get("group") {
+        crate::adaptive::AdaptiveScope::ProviderGroup(group.clone())
+    } else if let Some(agent) = agent.clone() {
+        crate::adaptive::AdaptiveScope::Agent(agent)
+    } else {
+        crate::adaptive::AdaptiveScope::Auto
+    };
+
+    let request = crate::models::ChatCompletionRequest {
+        model,
+        messages: vec![crate::models::ChatMessage {
+            role: "user".into(),
+            content: serde_json::Value::String(content),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }],
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: Some(false),
+        stop: None,
+        max_tokens: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        user: None,
+        request_id: None,
+        agent_name: agent,
+        extra: serde_json::Map::new(),
+    };
+
+    match crate::adaptive::routing_diagnostics(&state, &scope, &request) {
+        Ok(diagnostics) => Json(json!({ "success": true, "diagnostics": diagnostics })),
+        Err(error) => Json(json!({ "success": false, "error": error.to_string() })),
+    }
+}
+
+/// GET /admin/routing/groups — List adaptive provider groups visible to users.
+pub async fn admin_adaptive_routing_groups(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let groups = crate::adaptive::routing_groups_summary(&state);
+    Json(json!({
+        "enabled": state.config.adaptive_routing.enabled,
+        "groups": groups,
+        "total": groups.len(),
+    }))
+}
+
+/// GET /admin/routing/routes — List adaptive OpenAI-compatible route prefixes.
+pub async fn admin_adaptive_routing_routes(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let routes = crate::adaptive::routing_routes_summary(&state);
+    Json(json!({
+        "enabled": state.config.adaptive_routing.enabled,
+        "routes": routes,
+        "total": routes.len(),
+    }))
 }
 
 /// GET /admin/metadata/errors — Error summary across all models (last 30 days).
@@ -1197,5 +2185,293 @@ pub async fn admin_metadata_sync_status(State(state): State<AppState>) -> Json<s
             Json(json!({ "sources": sources, "total": sources.len() }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_attempt_analysis_prompt, dedupe_enabled_models, is_validation_model_mismatch,
+        key_rate_usage_json, record_admin_validation_attempt, summarize_attempts_for_routing,
+        validation_error_should_update_key_state, validation_failure_status,
+    };
+    use crate::config::KeyTier;
+    use crate::error::GatewayError;
+    use crate::metadata::RequestAttemptRow;
+    use crate::models::{KeyState, KeyStatus};
+    use std::collections::HashSet;
+
+    #[test]
+    fn rate_limited_key_usage_display_is_exhausted_even_when_counters_are_low() {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let mut key = KeyState::with_tier("limited-key".to_string(), KeyTier::Free);
+        key.status = KeyStatus::RateLimited;
+        key.rpd_limit = Some(100);
+        key.rpd_count = 8;
+        key.rpd_window_start = now / 86400;
+
+        let usage = key_rate_usage_json(&key);
+
+        assert_eq!(usage["blocked_by_status"], true);
+        assert_eq!(usage["exhausted"], true);
+        assert_eq!(usage["counter_exhausted"], false);
+        assert_eq!(usage["display_percent"].as_f64(), Some(100.0));
+        assert_eq!(usage["max_percent"].as_f64(), Some(8.0));
+        assert_eq!(usage["headroom_percent"].as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn region_unavailable_403_is_model_candidate_mismatch() {
+        let error =
+            GatewayError::http_error(403, "This model is not available in your region.", None);
+
+        assert!(is_validation_model_mismatch(&error));
+    }
+
+    #[test]
+    fn validation_candidates_are_deduped_and_skip_disabled_models() {
+        let disabled = HashSet::from(["bad-model".to_string()]);
+        let candidates = dedupe_enabled_models(
+            vec![
+                "bad-model".into(),
+                "working-model".into(),
+                "working-model".into(),
+                "fallback-model".into(),
+            ],
+            &disabled,
+        );
+
+        assert_eq!(
+            candidates,
+            vec!["working-model".to_string(), "fallback-model".to_string()]
+        );
+    }
+
+    #[test]
+    fn validation_transient_errors_are_inconclusive_not_key_state_updates() {
+        let upstream = GatewayError::UpstreamError("error decoding response body".into());
+        let timeout = GatewayError::Timeout("validation timed out".into());
+        let http_500 = GatewayError::http_error(500, "provider failed", None);
+
+        assert!(!validation_error_should_update_key_state(&upstream));
+        assert!(!validation_error_should_update_key_state(&timeout));
+        assert!(!validation_error_should_update_key_state(&http_500));
+        assert_eq!(validation_failure_status(&upstream), "inconclusive");
+    }
+
+    #[test]
+    fn validation_confirmed_auth_or_rate_limit_updates_key_state() {
+        let auth = GatewayError::http_error(401, "invalid api key", None);
+        let forbidden = GatewayError::http_error(403, "invalid api key", None);
+        let limited = GatewayError::http_error(429, "rate limited", Some(60));
+
+        assert!(validation_error_should_update_key_state(&auth));
+        assert!(validation_error_should_update_key_state(&forbidden));
+        assert!(validation_error_should_update_key_state(&limited));
+        assert_eq!(
+            validation_failure_status(&limited),
+            "key_limited_or_invalid"
+        );
+    }
+
+    #[test]
+    fn admin_validation_attempts_update_deployment_state() {
+        let path = std::env::temp_dir().join(format!(
+            "free-agent-gateway-admin-validation-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = crate::metadata::ModelMetaStore::open(&path).unwrap();
+        let meta = Some(store.clone());
+
+        record_admin_validation_attempt(
+            &meta,
+            "validate-1",
+            1,
+            "openrouter",
+            "google/gemma:free",
+            "sk-test-a",
+            Ok(200),
+            false,
+        );
+        record_admin_validation_attempt(
+            &meta,
+            "validate-1",
+            2,
+            "openrouter",
+            "restricted-model",
+            "sk-test-a",
+            Err(&GatewayError::http_error(
+                403,
+                "This model is not available in your region.",
+                None,
+            )),
+            true,
+        );
+
+        let attempts = store.get_recent_attempts(10).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().any(|attempt| attempt.success));
+        assert!(attempts.iter().any(|attempt| {
+            attempt.error_category.as_deref() == Some("region_forbidden")
+                && attempt.model_id == "restricted-model"
+        }));
+
+        let states = store.get_deployment_states().unwrap();
+        assert!(states.iter().any(|state| {
+            state.model_id == "google/gemma:free"
+                && state.success_count == 1
+                && state.consecutive_failures == 0
+        }));
+        assert!(states.iter().any(|state| {
+            state.model_id == "restricted-model"
+                && state.last_error_category.as_deref() == Some("region_forbidden")
+                && state.consecutive_failures == 1
+        }));
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attempt_analysis_identifies_rate_limited_and_flaky_deployments() {
+        let attempts = vec![
+            attempt_row(
+                "req-1",
+                1,
+                "openrouter",
+                "model-a",
+                "key-a",
+                false,
+                "rate_limited",
+            ),
+            attempt_row(
+                "req-2",
+                1,
+                "openrouter",
+                "model-a",
+                "key-a",
+                false,
+                "rate_limited",
+            ),
+            attempt_row(
+                "req-3",
+                1,
+                "nvidia",
+                "model-b",
+                "key-b",
+                false,
+                "upstream_error",
+            ),
+            attempt_row(
+                "req-4",
+                1,
+                "nvidia",
+                "model-b",
+                "key-b",
+                false,
+                "upstream_error",
+            ),
+            attempt_row("req-5", 1, "opencode", "model-c", "key-c", true, "success"),
+        ];
+
+        let analysis = summarize_attempts_for_routing(&attempts);
+
+        assert_eq!(analysis.total_attempts, 5);
+        assert_eq!(analysis.failed_attempts, 4);
+        assert_eq!(analysis.top_error_categories[0].category, "rate_limited");
+        assert!(analysis.recommendations.iter().any(|item| {
+            item.contains("openrouter/model-a/key-a") && item.contains("cooldown")
+        }));
+        assert!(analysis.recommendations.iter().any(|item| {
+            item.contains("nvidia/model-b/key-b") && item.contains("deprioritize")
+        }));
+    }
+
+    #[test]
+    fn attempt_analysis_detects_account_pool_saturation_for_provider_model() {
+        let attempts = vec![
+            attempt_row(
+                "req-1",
+                1,
+                "openrouter",
+                "model-a",
+                "key-a",
+                false,
+                "rate_limited",
+            ),
+            attempt_row(
+                "req-2",
+                1,
+                "openrouter",
+                "model-a",
+                "key-b",
+                false,
+                "rate_limited",
+            ),
+            attempt_row(
+                "req-3",
+                1,
+                "openrouter",
+                "model-a",
+                "key-c",
+                false,
+                "rate_limited",
+            ),
+            attempt_row("req-4", 1, "opencode", "model-a", "key-d", true, "success"),
+        ];
+
+        let analysis = summarize_attempts_for_routing(&attempts);
+
+        assert!(analysis.recommendations.iter().any(|item| {
+            item.contains("openrouter/model-a")
+                && item.contains("3 independent account")
+                && item.contains("switch provider")
+        }));
+    }
+
+    #[test]
+    fn attempt_analysis_prompt_is_redacted_and_mentions_real_quota_cost() {
+        let attempts = vec![attempt_row(
+            "req-1",
+            1,
+            "openrouter",
+            "model-a",
+            "key-fingerprint-only",
+            false,
+            "rate_limited",
+        )];
+        let prompt = build_attempt_analysis_prompt(&attempts, 1);
+
+        assert!(prompt.contains("This diagnostic model call is a real upstream request"));
+        assert!(prompt.contains("key-fingerprint-only"));
+        assert!(!prompt.contains("sk-"));
+        assert!(prompt.contains("openrouter"));
+    }
+
+    fn attempt_row(
+        request_id: &str,
+        attempt_index: i64,
+        provider: &str,
+        model_id: &str,
+        key_id: &str,
+        success: bool,
+        category: &str,
+    ) -> RequestAttemptRow {
+        RequestAttemptRow {
+            id: attempt_index,
+            request_id: request_id.to_string(),
+            attempt_index,
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            key_id: key_id.to_string(),
+            success,
+            error_category: (!success).then(|| category.to_string()),
+            http_status: (!success).then_some(if category == "rate_limited" { 429 } else { 500 }),
+            error_message: (!success).then(|| category.to_string()),
+            cooldown_seconds: None,
+            fallback: false,
+            created_at: 1_700_000_000 + attempt_index,
+        }
     }
 }

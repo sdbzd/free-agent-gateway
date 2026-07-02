@@ -5,6 +5,7 @@ use crate::config::ProviderConfig;
 use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
+use crate::providers::{send_stream_request, streaming_client};
 
 /// Ollama provider (local LLM inference).
 ///
@@ -121,11 +122,11 @@ impl Provider for OllamaProvider {
         };
 
         let url = format!("{}/api/chat", self.base_url);
-        let client = reqwest::Client::new();
+        let client = streaming_client(self.timeout_seconds)?;
         let resp = client
             .post(&url)
             .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+            .header("Accept-Encoding", "identity")
             .json(&ollama_req)
             .send()
             .await?;
@@ -160,14 +161,16 @@ impl Provider for OllamaProvider {
         };
 
         let url = format!("{}/api/chat", self.base_url);
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-            .json(&ollama_req)
-            .send()
-            .await?;
+        let client = streaming_client(self.timeout_seconds)?;
+        let resp = send_stream_request(
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept-Encoding", "identity")
+                .json(&ollama_req),
+            self.timeout_seconds,
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();

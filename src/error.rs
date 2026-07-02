@@ -193,7 +193,27 @@ impl GatewayError {
                 status: 403,
                 message,
                 ..
-            } => !is_cloudflare_or_waf_block(message),
+            } => !is_cloudflare_or_waf_block(message) && !is_model_or_region_forbidden(message),
+            _ => false,
+        }
+    }
+
+    pub fn is_key_attributable_failure(&self) -> bool {
+        match self {
+            Self::AuthFailed => true,
+            Self::HttpError { status: 401, .. } => true,
+            Self::HttpError {
+                status: 403,
+                message,
+                ..
+            } => {
+                !is_cloudflare_or_waf_block(message)
+                    && !is_model_or_region_forbidden(message)
+                    && looks_like_auth_forbidden(message)
+            }
+            Self::HttpError { status: 429, .. } => true,
+            Self::HttpError { status, .. } => *status >= 500,
+            Self::Timeout(_) | Self::Reqwest(_) | Self::UpstreamError(_) => true,
             _ => false,
         }
     }
@@ -205,6 +225,10 @@ impl GatewayError {
             Self::ModelNotFound(_) => "model_not_found",
             Self::NoAvailableKeys(_) => "no_keys",
             Self::AllProvidersFailed => "all_providers_failed",
+            Self::UpstreamError(message) if is_empty_response_error(message) => "empty_response",
+            Self::UpstreamError(message) if is_malformed_stream_error(message) => {
+                "malformed_stream"
+            }
             Self::UpstreamError(_) | Self::Reqwest(_) => "upstream_error",
             Self::HttpError { status: 429, .. } => "rate_limited",
             Self::HttpError { status: 401, .. } => "auth_failed",
@@ -213,6 +237,16 @@ impl GatewayError {
                 message,
                 ..
             } if is_cloudflare_or_waf_block(message) => "waf_blocked",
+            Self::HttpError {
+                status: 403,
+                message,
+                ..
+            } if is_region_forbidden(message) => "region_forbidden",
+            Self::HttpError {
+                status: 403,
+                message,
+                ..
+            } if is_model_forbidden(message) => "model_forbidden",
             Self::HttpError { status: 403, .. } => "auth_failed",
             Self::HttpError { status: 503, .. } => "upstream_error",
             Self::HttpError { .. } => "upstream_http_error",
@@ -240,6 +274,58 @@ pub fn is_cloudflare_or_waf_block(message: &str) -> bool {
         || lower.contains("waf")
 }
 
+pub fn is_model_or_region_forbidden(message: &str) -> bool {
+    is_region_forbidden(message) || is_model_forbidden(message)
+}
+
+pub fn is_region_forbidden(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not available in your region")
+        || lower.contains("region restricted")
+        || lower.contains("region is not supported")
+        || lower.contains("not supported in your region")
+}
+
+pub fn is_model_forbidden(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("do not have access to model")
+        || lower.contains("model is not available")
+        || lower.contains("model not available")
+        || lower.contains("model is not accessible")
+        || lower.contains("model_not_found")
+        || lower.contains("does not have access to model")
+        || lower.contains("not authorized for model")
+}
+
+pub fn is_malformed_stream_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("error decoding response body")
+        || lower.contains("incomplete streaming tool call arguments")
+        || lower.contains("invalid tool call")
+        || lower.contains("malformed sse")
+        || lower.contains("malformed stream")
+        || lower.contains("invalid streaming")
+}
+
+pub fn is_empty_response_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("empty chat completion response")
+        || lower.contains("empty streaming chat completion response")
+        || lower.contains("empty upstream response")
+}
+
+fn looks_like_auth_forbidden(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid api key")
+        || lower.contains("invalid token")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("permission denied")
+        || lower.contains("forbidden")
+        || lower.contains("insufficient")
+        || lower.contains("quota")
+}
+
 /// Convenient Result alias.
 pub type GatewayResult<T> = Result<T, GatewayError>;
 
@@ -258,6 +344,12 @@ pub fn parse_retry_after_value(value: &str) -> Option<u64> {
 }
 
 pub fn parse_retry_after_seconds(text: &str) -> Option<u64> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(seconds) = retry_after_from_json(&value)
+    {
+        return Some(seconds);
+    }
+
     let patterns = [
         r"(?i)(?:retry|try again|reset|available).{0,40}?(\d+)\s*(second|seconds|sec|s|minute|minutes|min|m|hour|hours|hr|h|day|days|d)\b",
         r"(?i)(\d+)\s*(second|seconds|sec|s|minute|minutes|min|m|hour|hours|hr|h|day|days|d).{0,40}?(?:retry|try again|reset|available)",
@@ -282,6 +374,33 @@ pub fn parse_retry_after_seconds(text: &str) -> Option<u64> {
     }
 
     None
+}
+
+fn retry_after_from_json(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for field in [
+                "retry_after",
+                "retry_after_seconds",
+                "cooldown_seconds",
+                "reset_after",
+                "reset_after_seconds",
+            ] {
+                if let Some(seconds) = map.get(field).and_then(json_retry_after_value) {
+                    return Some(seconds);
+                }
+            }
+            map.values().find_map(retry_after_from_json)
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(retry_after_from_json),
+        _ => None,
+    }
+}
+
+fn json_retry_after_value(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(parse_retry_after_value))
 }
 
 pub fn sanitize_diagnostic(message: &str) -> String {
@@ -355,6 +474,42 @@ mod tests {
 
         assert_eq!(error.category(), "waf_blocked");
         assert!(!error.is_auth_failure());
+        assert!(!error.is_key_attributable_failure());
+    }
+
+    #[test]
+    fn region_model_403_is_not_key_attributable() {
+        let error =
+            GatewayError::http_error(403, "This model is not available in your region.", None);
+
+        assert_eq!(error.category(), "region_forbidden");
+        assert!(!error.is_auth_failure());
+        assert!(!error.is_key_attributable_failure());
+    }
+
+    #[test]
+    fn model_forbidden_403_is_distinct_from_region_forbidden() {
+        let error = GatewayError::http_error(403, "You do not have access to model foo.", None);
+
+        assert_eq!(error.category(), "model_forbidden");
+        assert!(!error.is_auth_failure());
+        assert!(!error.is_key_attributable_failure());
+    }
+
+    #[test]
+    fn malformed_stream_errors_have_specific_category() {
+        let decode = GatewayError::UpstreamError("error decoding response body".into());
+        let tool = GatewayError::UpstreamError("incomplete streaming tool call arguments".into());
+
+        assert_eq!(decode.category(), "malformed_stream");
+        assert_eq!(tool.category(), "malformed_stream");
+    }
+
+    #[test]
+    fn empty_upstream_response_has_specific_category() {
+        let error = GatewayError::UpstreamError("empty streaming chat completion response".into());
+
+        assert_eq!(error.category(), "empty_response");
     }
 
     #[test]
@@ -363,5 +518,6 @@ mod tests {
 
         assert_eq!(error.category(), "auth_failed");
         assert!(error.is_auth_failure());
+        assert!(error.is_key_attributable_failure());
     }
 }

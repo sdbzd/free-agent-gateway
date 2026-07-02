@@ -10,6 +10,7 @@ use crate::error::{GatewayError, GatewayResult};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub server: ServerConfig,
+    #[serde(default)]
     pub routing: RoutingConfig,
     #[serde(default)]
     pub fallback: Vec<String>,
@@ -24,6 +25,10 @@ pub struct Config {
     pub state: StateConfig,
     #[serde(default)]
     pub cors: CorsConfig,
+    #[serde(default)]
+    pub adaptive_routing: AdaptiveRoutingConfig,
+    #[serde(default)]
+    pub context_compression: ContextCompressionConfig,
 }
 
 // ─── Server ─────────────────────────────────────────────────────────
@@ -56,6 +61,43 @@ fn default_timeout() -> u64 {
 }
 fn default_sse_keepalive() -> u64 {
     15
+}
+
+// ─── Context Compression ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContextCompressionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_context_compression_command")]
+    pub command: String,
+    #[serde(default = "default_context_compression_min_message_tokens")]
+    pub min_message_tokens: u32,
+    #[serde(default = "default_context_compression_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for ContextCompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: default_context_compression_command(),
+            min_message_tokens: default_context_compression_min_message_tokens(),
+            timeout_seconds: default_context_compression_timeout_seconds(),
+        }
+    }
+}
+
+fn default_context_compression_command() -> String {
+    "G:\\ai\\AgentsTools\\rtk.exe".into()
+}
+
+fn default_context_compression_min_message_tokens() -> u32 {
+    2_000
+}
+
+fn default_context_compression_timeout_seconds() -> u64 {
+    3
 }
 
 // ─── Routing ────────────────────────────────────────────────────────
@@ -111,6 +153,96 @@ fn default_auto_discover() -> bool {
     true
 }
 
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: default_routing_strategy(),
+            fail_threshold: default_fail_threshold(),
+            cooldown_seconds: default_cooldown(),
+            auto_discover: default_auto_discover(),
+        }
+    }
+}
+
+// ─── Adaptive Routing ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveMode {
+    #[default]
+    Observe,
+    Assist,
+    Auto,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdaptiveRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: AdaptiveMode,
+    #[serde(default)]
+    pub allow_paid: bool,
+    #[serde(default = "default_adaptive_candidate_limit")]
+    pub candidate_limit: usize,
+    #[serde(default = "default_adaptive_learning_window_days")]
+    pub learning_window_days: i64,
+    #[serde(default = "default_true")]
+    pub hard_override_on_capability_mismatch: bool,
+    #[serde(default)]
+    pub auto_models: HashMap<String, AutoModelConfig>,
+    #[serde(default)]
+    pub agent_profiles: HashMap<String, AdaptiveAgentProfile>,
+    #[serde(default)]
+    pub routing_groups: HashMap<String, RoutingGroupConfig>,
+}
+
+impl Default for AdaptiveRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: AdaptiveMode::Observe,
+            allow_paid: false,
+            candidate_limit: default_adaptive_candidate_limit(),
+            learning_window_days: default_adaptive_learning_window_days(),
+            hard_override_on_capability_mismatch: true,
+            auto_models: HashMap::new(),
+            agent_profiles: HashMap::new(),
+            routing_groups: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AutoModelConfig {
+    #[serde(default)]
+    pub task: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AdaptiveAgentProfile {
+    #[serde(default)]
+    pub default_auto_model: String,
+    #[serde(default)]
+    pub preferred_tasks: Vec<String>,
+    #[serde(default)]
+    pub provider_groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RoutingGroupConfig {
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
+fn default_adaptive_candidate_limit() -> usize {
+    20
+}
+
+fn default_adaptive_learning_window_days() -> i64 {
+    7
+}
+
 // ─── Agent ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,6 +266,8 @@ pub struct ModelAlias {
 pub enum ProviderType {
     GithubModels,
     Nvidia,
+    #[serde(rename = "huggingface", alias = "hugging_face")]
+    HuggingFace,
     OpenaiCompatible,
     Ollama,
 }
@@ -143,6 +277,7 @@ impl std::fmt::Display for ProviderType {
         match self {
             Self::GithubModels => write!(f, "github_models"),
             Self::Nvidia => write!(f, "nvidia"),
+            Self::HuggingFace => write!(f, "huggingface"),
             Self::OpenaiCompatible => write!(f, "openai_compatible"),
             Self::Ollama => write!(f, "ollama"),
         }
@@ -265,6 +400,8 @@ pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub base_url: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
     pub keys: Vec<KeyConfig>,
     #[serde(default)]
     pub health_check_model: String,
@@ -294,7 +431,7 @@ pub struct WatcherConfig {
 }
 
 fn default_watcher_interval() -> u64 {
-    60
+    600
 }
 fn default_watcher_timeout() -> u64 {
     10

@@ -22,6 +22,15 @@ routing:
   # Auto-discover models from providers
   auto_discover: true
 
+# Optional local context compression for large tool/log outputs.
+# This never compresses normal user messages; it only rewrites large role=tool
+# content before sending the request upstream.
+context_compression:
+  enabled: false
+  command: "G:\\ai\\AgentsTools\\rtk.exe"
+  min_message_tokens: 2000
+  timeout_seconds: 3
+
 # Provider fallback order
 fallback:
 - "cerebras"
@@ -30,6 +39,7 @@ fallback:
 - "opencode"
 - "openrouter"
 - "groq"
+- "huggingface"
 - "ollama"
 
 # Model aliases for agents
@@ -81,7 +91,6 @@ providers:
         # Set these if your Cerebras account publishes per-key quotas.
         # rpm_limit: 30
         # rpd_limit: 1000
-    health_check_model: "llama3.1-8b"
     timeout_seconds: 30
 
   openrouter:
@@ -162,12 +171,26 @@ providers:
     type: "openai_compatible"
     enabled: false
     base_url: "https://api.groq.com/openai/v1"
+    # Optional explicit proxy for providers blocked by local network/region.
+    # If unset, reqwest still honors process-level HTTP_PROXY/HTTPS_PROXY/ALL_PROXY.
+    # proxy_url: "http://127.0.0.1:7890"
     keys:
       - value: "${GROQ_API_KEY_1}"
         tier: free
       - value: "${GROQ_API_KEY_2}"
         tier: free
-    health_check_model: "llama3-8b-8192"
+    timeout_seconds: 30
+
+  huggingface:
+    type: "huggingface"
+    enabled: false
+    base_url: "https://router.huggingface.co/v1"
+    keys:
+      - value: "${HF_TOKEN}"
+        tier: free
+    # Optional: set to a known HF router model after Refresh Models has
+    # confirmed it for your key. Otherwise Test/Validate uses discovered inventory.
+    health_check_model: ""
     timeout_seconds: 30
 
   ollama:
@@ -182,11 +205,42 @@ providers:
     # Ollama is the ultimate fallback
     priority: 100
 
+# Adaptive routing settings (opt-in; existing /v1 behavior is unchanged)
+adaptive_routing:
+  enabled: false
+  # observe = log decisions only; assist = override hard mismatches; auto = score-driven selection
+  mode: "observe"
+  allow_paid: false
+  candidate_limit: 20
+  learning_window_days: 7
+  hard_override_on_capability_mismatch: true
+  auto_models:
+    coding-auto:
+      task: "coding"
+    document-auto:
+      task: "document"
+    vision-auto:
+      task: "vision"
+  agent_profiles:
+    coding_agent:
+      default_auto_model: "coding-auto"
+      preferred_tasks: ["coding", "tools", "reasoning"]
+      provider_groups: ["coding"]
+    document:
+      default_auto_model: "document-auto"
+      preferred_tasks: ["long_context", "document"]
+      provider_groups: ["free-cloud"]
+  routing_groups:
+    free-cloud:
+      providers: ["openrouter", "nvidia", "groq", "huggingface", "cloudflare"]
+    coding:
+      providers: ["openrouter", "nvidia"]
+
 # Health watcher settings
 watcher:
   enabled: true
   # Check interval in seconds
-  interval_seconds: 60
+  interval_seconds: 600
   # Timeout for each health check
   check_timeout_seconds: 10
 

@@ -6,6 +6,7 @@ pub mod error;
 pub mod metadata;
 pub mod models;
 
+pub mod adaptive;
 pub mod api;
 pub mod health;
 pub mod keyhub;

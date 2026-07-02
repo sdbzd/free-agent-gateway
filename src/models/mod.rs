@@ -114,6 +114,177 @@ pub fn extract_usage(body: &serde_json::Value) -> (Option<u32>, Option<u32>) {
     (prompt, completion)
 }
 
+pub fn estimate_text_tokens(text: &str) -> u32 {
+    let chars = text.chars().count() as u32;
+    if chars == 0 { 0 } else { chars.div_ceil(4) }
+}
+
+pub fn content_to_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                    Some(text.to_string())
+                } else if part.get("type").and_then(|value| value.as_str()) == Some("input_text") {
+                    part.get("input_text")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+pub fn estimate_message_tokens(messages: &[ChatMessage]) -> u32 {
+    messages
+        .iter()
+        .map(|message| {
+            let mut total = estimate_text_tokens(&content_to_text(&message.content));
+            if let Some(tool_calls) = &message.tool_calls {
+                total += estimate_text_tokens(&tool_calls.to_string());
+            }
+            if let Some(tool_call_id) = &message.tool_call_id {
+                total += estimate_text_tokens(tool_call_id);
+            }
+            total
+        })
+        .sum()
+}
+
+pub fn compress_large_tool_context<F>(
+    mut request: ChatCompletionRequest,
+    min_message_tokens: u32,
+    mut compressor: F,
+) -> ChatCompletionRequest
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    for message in &mut request.messages {
+        if message.role != "tool" {
+            continue;
+        }
+        let text = content_to_text(&message.content);
+        if estimate_text_tokens(&text) < min_message_tokens {
+            continue;
+        }
+        let Some(compacted) = compressor(&text).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        message.content =
+            serde_json::Value::String(format!("[Compressed tool output]\n{compacted}"));
+    }
+    request
+}
+
+pub fn response_has_useful_output(body: &serde_json::Value) -> bool {
+    body.get("choices")
+        .and_then(|choices| choices.as_array())
+        .map(|choices| {
+            choices.iter().any(|choice| {
+                let Some(message) = choice.get("message") else {
+                    return false;
+                };
+                message
+                    .get("content")
+                    .map(content_to_text)
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
+                    || message
+                        .get("tool_calls")
+                        .and_then(|value| value.as_array())
+                        .map(|calls| calls.iter().any(tool_call_is_useful))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn tool_call_is_useful(call: &serde_json::Value) -> bool {
+    call.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(|name| name.as_str())
+        .map(|name| !name.trim().is_empty())
+        .unwrap_or(false)
+}
+
+pub fn repair_tool_call_arguments(body: &mut serde_json::Value) {
+    let Some(choices) = body
+        .get_mut("choices")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    for choice in choices {
+        let Some(tool_calls) = choice
+            .get_mut("message")
+            .and_then(|message| message.get_mut("tool_calls"))
+            .and_then(|value| value.as_array_mut())
+        else {
+            continue;
+        };
+        for call in tool_calls {
+            let Some(arguments) = call
+                .get_mut("function")
+                .and_then(|function| function.get_mut("arguments"))
+            else {
+                continue;
+            };
+            if arguments.is_string() {
+                continue;
+            }
+            let repaired = if arguments.is_null() {
+                "{}".to_string()
+            } else {
+                arguments.to_string()
+            };
+            *arguments = serde_json::Value::String(repaired);
+        }
+    }
+}
+
+pub fn extract_usage_or_estimate(
+    body: &serde_json::Value,
+    prompt_estimate: u32,
+) -> (Option<u32>, Option<u32>, bool) {
+    let (prompt, completion) = extract_usage(body);
+    if prompt.is_some() || completion.is_some() {
+        return (prompt, completion, true);
+    }
+
+    let completion_estimate = body
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .map(|choices| {
+            choices
+                .iter()
+                .map(|choice| {
+                    let Some(message) = choice.get("message") else {
+                        return 0;
+                    };
+                    let mut total = message
+                        .get("content")
+                        .map(content_to_text)
+                        .map(|text| estimate_text_tokens(&text))
+                        .unwrap_or(0);
+                    if let Some(tool_calls) = message.get("tool_calls") {
+                        total += estimate_text_tokens(&tool_calls.to_string());
+                    }
+                    total
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+
+    (Some(prompt_estimate), Some(completion_estimate), false)
+}
+
 // ─── OpenAI-compatible Chat Completion Response ─────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +382,7 @@ pub struct ModelInfo {
 #[serde(rename_all = "snake_case")]
 pub enum KeyStatus {
     Available,
+    Probing,
     Cooldown,
     RateLimited,
     Disabled,
@@ -220,6 +392,7 @@ impl std::fmt::Display for KeyStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Available => write!(f, "available"),
+            Self::Probing => write!(f, "probing"),
             Self::Cooldown => write!(f, "cooldown"),
             Self::RateLimited => write!(f, "rate_limited"),
             Self::Disabled => write!(f, "disabled"),
@@ -502,6 +675,180 @@ mod tests {
         assert!(
             output.get("tool_choice").and_then(|v| v.as_str()) == Some("auto"),
             "tool_choice value should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_tool_call_argument_objects_are_repaired_to_strings() {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": {"city": "Shanghai"}
+                        }
+                    }]
+                }
+            }]
+        });
+
+        repair_tool_call_arguments(&mut body);
+
+        let args = body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(args, r#"{"city":"Shanghai"}"#);
+        assert!(response_has_useful_output(&body));
+    }
+
+    #[test]
+    fn test_null_tool_call_arguments_are_repaired_to_empty_object_string() {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": null
+                        }
+                    }]
+                }
+            }]
+        });
+
+        repair_tool_call_arguments(&mut body);
+
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+        assert!(response_has_useful_output(&body));
+    }
+
+    #[test]
+    fn test_empty_tool_call_shell_is_not_useful_output() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{}]
+                }
+            }]
+        });
+
+        assert!(!response_has_useful_output(&body));
+    }
+
+    #[test]
+    fn test_usage_estimation_marks_tokens_as_estimated() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "12345678"
+                }
+            }]
+        });
+
+        let (prompt, completion, reported) = extract_usage_or_estimate(&body, 7);
+
+        assert_eq!(prompt, Some(7));
+        assert_eq!(completion, Some(2));
+        assert!(!reported);
+    }
+
+    #[test]
+    fn compress_large_tool_context_keeps_user_messages_unchanged() {
+        let request = ChatCompletionRequest {
+            model: "auto".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("x".repeat(80)),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    extra: serde_json::Map::new(),
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: serde_json::Value::String("log line\n".repeat(20)),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call-1".to_string()),
+                    extra: serde_json::Map::new(),
+                },
+            ],
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            max_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            request_id: None,
+            agent_name: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let compressed = compress_large_tool_context(request, 10, |text| {
+            assert!(text.contains("log line"));
+            Some("compact log".to_string())
+        });
+
+        assert_eq!(
+            compressed.messages[0].content,
+            serde_json::Value::String("x".repeat(80))
+        );
+        assert_eq!(
+            compressed.messages[1].content,
+            serde_json::Value::String("[Compressed tool output]\ncompact log".to_string())
+        );
+    }
+
+    #[test]
+    fn compress_large_tool_context_uses_original_when_compressor_fails() {
+        let request = ChatCompletionRequest {
+            model: "auto".to_string(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::Value::String("log line\n".repeat(20)),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            max_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            request_id: None,
+            agent_name: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let compressed = compress_large_tool_context(request, 10, |_text| None);
+
+        assert_eq!(
+            compressed.messages[0].content,
+            serde_json::Value::String("log line\n".repeat(20))
         );
     }
 }

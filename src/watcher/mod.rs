@@ -66,9 +66,6 @@ impl Watcher {
             let mut last_error = String::new();
 
             for (api_key, tier) in self.keyhub.discovery_keys(&provider_name) {
-                if !self.keyhub.reserve_key(&provider_name, &api_key) {
-                    continue;
-                }
                 let started = std::time::Instant::now();
                 match tokio::time::timeout(check_timeout, provider.list_models(&api_key)).await {
                     Ok(Ok(models)) => {
@@ -76,8 +73,6 @@ impl Watcher {
                         successful_keys += 1;
                         provider_models.extend(models.iter().cloned());
                         self.keyhub.update_models(&provider_name, &api_key, models);
-                        self.keyhub
-                            .report_reserved_success(&provider_name, &api_key, None, None);
                         tracing::debug!(
                             provider = %provider_name,
                             key = %crate::keyhub::key_fingerprint(&api_key),
@@ -87,8 +82,6 @@ impl Watcher {
                         );
                     }
                     Ok(Err(error)) => {
-                        self.keyhub
-                            .report_gateway_error(&provider_name, &api_key, &error);
                         last_error = error.to_string();
                         self.keyhub.record_model_error(
                             &provider_name,
@@ -149,5 +142,157 @@ impl Watcher {
             self.check_all().await;
             tokio::time::sleep(interval).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::collections::HashMap;
+
+    use crate::config::{
+        Config, KeyConfig, KeyTier, ProviderConfig, ProviderType, RoutingConfig, RoutingStrategy,
+        ServerConfig, WatcherConfig,
+    };
+    use crate::error::{GatewayError, GatewayResult};
+    use crate::models::ChatCompletionRequest;
+    use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
+
+    #[derive(Debug)]
+    struct DiscoveryErrorProvider;
+
+    #[async_trait]
+    impl Provider for DiscoveryErrorProvider {
+        fn name(&self) -> &str {
+            "opencode"
+        }
+
+        fn base_url(&self) -> &str {
+            "http://opencode"
+        }
+
+        async fn list_models(&self, _api_key: &str) -> GatewayResult<Vec<String>> {
+            Err(GatewayError::UpstreamError(
+                "error decoding response body".into(),
+            ))
+        }
+
+        async fn chat(
+            &self,
+            _api_key: &str,
+            _request: ChatCompletionRequest,
+        ) -> GatewayResult<ChatResponse> {
+            unreachable!("watcher model discovery test does not call chat")
+        }
+
+        async fn chat_stream(
+            &self,
+            _api_key: &str,
+            _request: ChatCompletionRequest,
+        ) -> GatewayResult<StreamResponse> {
+            Ok(Box::pin(futures::stream::iter(Vec::<
+                Result<Bytes, GatewayError>,
+            >::new())))
+        }
+
+        async fn health_check(&self, _api_key: &str) -> GatewayResult<u64> {
+            Ok(1)
+        }
+
+        fn health_check_model(&self) -> &str {
+            "working-model"
+        }
+
+        fn timeout_seconds(&self) -> u64 {
+            5
+        }
+
+        fn priority(&self) -> u32 {
+            0
+        }
+    }
+
+    fn watcher_test_config() -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenaiCompatible,
+                enabled: true,
+                base_url: "http://opencode".into(),
+                proxy_url: None,
+                keys: vec![KeyConfig::detailed("opencode-key", KeyTier::Free)],
+                health_check_model: "working-model".into(),
+                timeout_seconds: 5,
+                priority: 0,
+            },
+        );
+
+        Config {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 9000,
+                log_level: "info".into(),
+                request_timeout: 120,
+                sse_keepalive: 15,
+            },
+            routing: RoutingConfig {
+                strategy: RoutingStrategy::LeastFailed,
+                fail_threshold: 3,
+                cooldown_seconds: 60,
+                auto_discover: true,
+            },
+            fallback: vec!["opencode".into()],
+            agents: HashMap::new(),
+            models: HashMap::new(),
+            providers,
+            watcher: WatcherConfig {
+                enabled: true,
+                interval_seconds: 600,
+                check_timeout_seconds: 5,
+            },
+            state: Default::default(),
+            cors: Default::default(),
+            adaptive_routing: Default::default(),
+            context_compression: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_discovery_error_does_not_penalize_key_availability() {
+        let config = Arc::new(watcher_test_config());
+        let providers = Arc::new(DashMap::new());
+        providers.insert(
+            "opencode".into(),
+            Box::new(DiscoveryErrorProvider) as BoxedProvider,
+        );
+        let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+        keyhub.register_provider("opencode", config.providers["opencode"].keys.clone());
+        let health = Arc::new(HealthRegistry::new());
+        health.register("opencode", &config.providers["opencode"]);
+        let watcher = Watcher::new(config, providers, keyhub.clone(), health);
+
+        for _ in 0..3 {
+            watcher.check_all().await;
+        }
+
+        let snapshot = keyhub.snapshot();
+        let key = snapshot
+            .iter()
+            .find(|(provider, _)| provider == "opencode")
+            .unwrap()
+            .1
+            .first()
+            .unwrap();
+        assert_eq!(key.status, crate::models::KeyStatus::Available);
+        assert_eq!(key.fail_count, 0);
+        assert_eq!(key.total_fail_count, 0);
+        assert!(
+            key.models_last_error
+                .contains("error decoding response body")
+        );
+        assert_eq!(keyhub.available_count("opencode"), 1);
     }
 }

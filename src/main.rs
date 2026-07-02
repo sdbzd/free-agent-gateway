@@ -20,12 +20,21 @@ use parking_lot::RwLock;
 use free_agent_gateway::{
     AppState,
     api::{
-        self, admin_config_get, admin_config_put, admin_events, admin_index, admin_keys,
-        admin_metadata_errors, admin_metadata_models, admin_metadata_stats,
-        admin_metadata_sync_status, admin_metadata_usage, admin_provider_key_restore,
-        admin_provider_models_get, admin_provider_models_toggle, admin_provider_refresh,
-        admin_provider_test, admin_save, admin_status, chat_completions, health, list_models,
-        metrics, metrics_prometheus, status,
+        self, adaptive_agent_chat_completions, adaptive_agent_models, adaptive_chat_completions,
+        adaptive_models, adaptive_provider_chat_completions,
+        adaptive_provider_group_chat_completions, adaptive_provider_group_models,
+        adaptive_provider_models, admin_adaptive_routing_diagnostics,
+        admin_adaptive_routing_groups, admin_adaptive_routing_routes, admin_config_get,
+        admin_config_put, admin_events, admin_index, admin_keys, admin_legacy_index,
+        admin_metadata_attempts, admin_metadata_attempts_analyze, admin_metadata_capabilities,
+        admin_metadata_deployments, admin_metadata_errors, admin_metadata_models,
+        admin_metadata_stats, admin_metadata_sync_status, admin_metadata_tasks,
+        admin_metadata_usage, admin_metadata_usage_daily, admin_metadata_usage_hourly,
+        admin_metadata_usage_lifetime, admin_model_families, admin_provider_key_restore,
+        admin_provider_key_validate, admin_provider_models_get, admin_provider_models_toggle,
+        admin_provider_refresh, admin_provider_test, admin_save, admin_status, admin_usage_index,
+        chat_completions, completions, embeddings, health, list_models, metrics,
+        metrics_prometheus, responses, status,
     },
     config::Config,
     health::HealthRegistry,
@@ -234,7 +243,31 @@ async fn main() -> anyhow::Result<()> {
     let app = AxumRouter::new()
         // OpenAI-compatible routes
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+        .route("/v1/responses", post(responses))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
+        // Adaptive OpenAI-compatible route namespaces
+        .route("/auto/v1/chat/completions", post(adaptive_chat_completions))
+        .route("/auto/v1/models", get(adaptive_models))
+        .route(
+            "/agents/{agent}/v1/chat/completions",
+            post(adaptive_agent_chat_completions),
+        )
+        .route("/agents/{agent}/v1/models", get(adaptive_agent_models))
+        .route(
+            "/provider-groups/{group}/v1/chat/completions",
+            post(adaptive_provider_group_chat_completions),
+        )
+        .route(
+            "/provider-groups/{group}/v1/models",
+            get(adaptive_provider_group_models),
+        )
+        .route(
+            "/{provider}/v1/chat/completions",
+            post(adaptive_provider_chat_completions),
+        )
+        .route("/{provider}/v1/models", get(adaptive_provider_models))
         // Admin/management routes
         .route("/health", get(health))
         .route("/status", get(status))
@@ -243,6 +276,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/providers", get(api::providers))
         // Admin dashboard & management routes
         .route("/admin", get(admin_index))
+        .route("/admin/usage", get(admin_usage_index))
+        .route("/admin/legacy", get(admin_legacy_index))
         .route("/admin/config", get(admin_config_get).put(admin_config_put))
         .route("/admin/status", get(admin_status))
         .route(
@@ -253,6 +288,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/providers/{name}/keys/{key_id}/restore",
             post(admin_provider_key_restore),
+        )
+        .route(
+            "/admin/providers/{name}/keys/{key_id}/validate",
+            post(admin_provider_key_validate),
         )
         .route(
             "/admin/providers/{name}/models",
@@ -266,11 +305,44 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/keys", get(admin_keys))
         .route("/admin/save", post(admin_save))
         // Model metadata routes
+        .route("/admin/models/families", get(admin_model_families))
         .route("/admin/metadata", get(admin_metadata_stats))
         .route("/admin/metadata/models", get(admin_metadata_models))
+        .route("/admin/metadata/attempts", get(admin_metadata_attempts))
+        .route(
+            "/admin/metadata/attempts/analyze",
+            get(admin_metadata_attempts_analyze),
+        )
+        .route(
+            "/admin/metadata/deployments",
+            get(admin_metadata_deployments),
+        )
         .route("/admin/metadata/usage", get(admin_metadata_usage))
+        .route(
+            "/admin/metadata/usage/daily",
+            get(admin_metadata_usage_daily),
+        )
+        .route(
+            "/admin/metadata/usage/hourly",
+            get(admin_metadata_usage_hourly),
+        )
+        .route(
+            "/admin/metadata/usage/lifetime",
+            get(admin_metadata_usage_lifetime),
+        )
+        .route("/admin/metadata/tasks", get(admin_metadata_tasks))
+        .route(
+            "/admin/metadata/capabilities",
+            get(admin_metadata_capabilities),
+        )
         .route("/admin/metadata/errors", get(admin_metadata_errors))
         .route("/admin/metadata/sync", get(admin_metadata_sync_status))
+        .route(
+            "/admin/routing/adaptive",
+            get(admin_adaptive_routing_diagnostics),
+        )
+        .route("/admin/routing/groups", get(admin_adaptive_routing_groups))
+        .route("/admin/routing/routes", get(admin_adaptive_routing_routes))
         // Middleware
         .layer(cors)
         .layer(TraceLayer::new_for_http())

@@ -4,6 +4,7 @@ use crate::config::ProviderConfig;
 use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
+use crate::providers::{send_stream_request, streaming_client};
 
 /// NVIDIA NIM provider (integrate.api.nvidia.com).
 #[derive(Debug)]
@@ -119,15 +120,17 @@ impl Provider for NvidiaProvider {
         stream_request.stream = Some(true);
 
         let url = format!("{}/chat/completions", self.base_url);
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-            .json(&stream_request)
-            .send()
-            .await?;
+        let client = streaming_client(self.timeout_seconds)?;
+        let resp = send_stream_request(
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .header("Accept-Encoding", "identity")
+                .json(&stream_request),
+            self.timeout_seconds,
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();

@@ -1,389 +1,210 @@
 # free-agent-gateway
 
-Read this in: [中文](README.zh-CN.md) | [English](README.en.md)
+一个给个人 AI Agent 使用的 OpenAI 兼容网关。
 
-## Safe key-level routing
-
-Each API key has its own model inventory and cost tier. Configure keys as
-objects and explicitly mark free credentials:
-
-```yaml
-providers:
-  example:
-    type: openai_compatible
-    base_url: "https://example.com/v1"
-    keys:
-      - value: "${EXAMPLE_FREE_KEY}"
-        tier: free
-        rpm_limit: 20
-        rpd_limit: 200
-        tpm_limit: 20000
-        tpd_limit: 200000
-      - value: "${EXAMPLE_PAID_KEY}"
-        tier: paid
-```
-
-Normal routing uses available `free` keys that advertise the exact requested
-model. `paid` keys are reserved for last-resort paid escalation after free keys
-are exhausted or rate-limited. `unknown` keys are never used automatically.
-Legacy string keys are treated as `unknown` until migrated.
-
-`models` aliases and `health_check_model` are optional. Provider fallback never
-changes the requested model.
-
-You do not need to know provider-side quotas up front. Set
-`routing.strategy: least_rate` to balance requests across all providers and keys
-by observed daily/minute usage first, then by learned headroom and failure
-pressure. When a key returns 429, the gateway learns an observed RPM/RPD limit
-for that key and keeps other keys from the same provider available.
-
-For topped-up keys that should still participate in normal free-model routing,
-keep `tier: free` and set the higher `rpm_limit` / `rpd_limit` if you know it.
-Use `tier: paid` only for last-resort paid escalation.
-
-> OpenClaw / Hermes 当前统一 AI 入口 — free-agent-gateway + KeyHub + Model Router + Health Watcher
-
-一个单 EXE 部署的 AI 网关，统一管理 GitHub Models、NVIDIA NIM、OpenCode、Ollama 等多个 Provider。当前主要服务 OpenClaw 和 Hermes-Agent，后续可扩展到 OpenHuman、ZeroClaw、Coding Agent、MCP Agent 等其他 Agent。
-
-## 特性
-
-- 🦀 **Rust 编写** — 高性能、内存安全、单文件部署
-- 🔑 **KeyHub** — 每个 Provider 支持多 Key 自动轮换
-- 🔄 **自动故障切换** — 429/5xx/超时自动切换 Provider 和 Key
-- 🧭 **智能路由** — 支持 RoundRobin/Random/LeastFailed/LeastRate/Priority 策略
-- 🤖 **Agent 感知** — 根据 Agent 名称自动选择默认模型
-- 📡 **SSE 流式输出** — 完整支持 `stream=true`
-- 🏥 **健康监控** — 后台 Watcher 每 60 秒检查 Provider 健康状态
-- 💾 **状态持久化** — 无数据库，使用 JSON 文件保存状态
-- 🔒 **安全日志** — 自动过滤敏感信息（apikey/token/cookie）
-- 📊 **管理面板** — 浏览器内建的 Admin Dashboard，实时监控 Provider/Key/Model 状态
-- 💬 **Chat 测试** — 内嵌 Chat Test 页面，直接选择 Provider/Key/Model 进行消息测试
-- 🔤 **流式 Token 用量追踪** — 流式响应自动解析最终 SSE chunk 提取 token 用量
-
-## 支持的 Provider
-
-| Provider | 类型 | 说明 |
-|----------|------|------|
-| `github_models` | GitHub Models | Azure 托管的 OpenAI 模型 |
-| `nvidia` | NVIDIA NIM | NVIDIA NIM 推理 API |
-| `openai_compatible` | OpenAI 兼容 | 任何兼容 OpenAI API 的服务 |
-| `ollama` | Ollama | 本地 LLM 推理（最终 Fallback） |
-
-OpenRouter、Cerebras、OpenCode 等 OpenAI-compatible 服务都使用
-`type: "openai_compatible"`，只需要配置各自的 `base_url`。
-
-## 快速开始
-
-### 编译
-
-```bash
-# 需要 Rust Stable 1.85+
-# Edition 2024 需要较新版本 Rust
-
-cargo build --release
-```
-
-编译产物在 `target/release/free-agent-gateway.exe`（Windows）或 `target/release/free-agent-gateway`（Linux）。
-
-Linux 推荐使用发布脚本，它会构建 release 二进制并打包 `config.yaml.sample`：
-
-```bash
-chmod +x scripts/build-linux.sh
-./scripts/build-linux.sh
-```
-
-产物位置：
+它把 OpenRouter、OpenCode、NVIDIA NIM、Groq、Cerebras、Cloudflare Workers AI、Hugging Face Router、本地 Ollama 等不同来源统一成一个本地 API：
 
 ```text
-dist/free-agent-gateway-linux-<arch>/free-agent-gateway
-dist/free-agent-gateway-linux-<arch>.tar.gz
+http://127.0.0.1:9000/v1
 ```
 
-GitHub Actions 会在 Ubuntu 上自动生成 `free-agent-gateway-linux-x86_64` artifact。
+你的 Agent 只需要接入这一个地址，网关负责在多个 provider、多个 key、多个模型之间自动选择、轮换、降级和记录状态。
 
-### 配置
+## 适合解决什么问题
 
-编辑 `config.yaml`，设置 Provider 的 API Key：
+- 免费模型和免费 key 很多，但每家限制不同，手工切换很麻烦。
+- 某个 key 429、403、5xx 或返回空内容时，希望自动换下一个可用 key。
+- 同一个模型在不同 provider 上都可用，希望统一管理和调度。
+- 希望 OpenAI SDK、Codex、OpenClaw、Hermes、各种 Agent 工具都用同一个入口。
+- 希望在浏览器里看到 key、模型、provider、token、错误和冷却状态。
+
+## 主要功能
+
+- OpenAI 兼容接口：`/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses`
+- 流式输出支持：兼容 `stream=true`，并处理 stream tool calls
+- 多 provider 聚合：一个网关管理多个上游 API
+- 多 key 自动轮换：同一 provider 下多个 key 自动接管
+- 免费优先：`tier: free` 优先使用，`tier: paid` 只作为最后兜底
+- 真实可用性判断：区分认证错误、额度限制、区域不可用、模型不可用、临时 5xx、WAF/Cloudflare 拦截
+- 冷却和恢复：429 后按 `Retry-After` 或已学习规则冷却，避免反复打坏 key
+- 模型列表缓存：`/v1/models` 不再每次慢速全量探测
+- 模型合并显示：可把同一模型的 `:free` 等价格后缀合并展示，同时保留实际调用路由
+- Provider 前缀路由：可以直接调用指定 provider
+- 自动调度路由：可按任务、agent、能力、历史错误和可用额度选择模型
+- Token 统计：记录输入、输出、总 token，区分 provider 上报值和本地估算值
+- 用量面板：按 1 天、7 天、30 天、90 天等维度查看使用趋势
+- 浏览器管理界面：查看 provider、key、模型、错误、token、路由分组和健康状态
+- 本地 Ollama 支持：可作为本地 fallback
+- Hugging Face Router 预留：后续填入 `HF_TOKEN` 即可启用
+
+## 快速使用
+
+启动 free-agent-gateway 后，打开浏览器管理页：
+
+```text
+http://127.0.0.1:9000/admin
+```
+
+把你的 Agent、OpenAI SDK 或其他兼容工具的 API 地址改成：
+
+```text
+http://127.0.0.1:9000/v1
+```
+
+## 配置 key
+
+编辑 `config.yaml`，给需要启用的 provider 填入 key。
+
+推荐用环境变量，不要把真实 key 写进 Git：
 
 ```yaml
 providers:
-  cerebras:
+  openrouter:
     type: "openai_compatible"
     enabled: true
-    base_url: "https://api.cerebras.ai/v1"
+    base_url: "https://openrouter.ai/api/v1"
     keys:
-      - value: "${CEREBRAS_API_KEY}"
+      - value: "${OPENROUTER_API_KEY}"
         tier: free
-        rpm_limit: 30
+        rpm_limit: 20
         rpd_limit: 1000
-    health_check_model: "llama3.1-8b"
-  ollama:
-    type: "ollama"
+
+  huggingface:
+    type: "huggingface"
     enabled: false
-    base_url: "http://localhost:11434"
+    base_url: "https://router.huggingface.co/v1"
     keys:
-      - "ollama"
+      - value: "${HF_TOKEN}"
+        tier: free
 ```
 
-### 启动
+`tier` 的含义：
 
-```bash
-# Windows
-.\free-agent-gateway.exe
+- `free`：正常自动调度使用
+- `paid`：只在免费 key 不可用时兜底
+- `unknown`：不会自动使用，适合还没确认额度和成本的 key
 
-# Linux
-./free-agent-gateway
-```
+## 调用方式
 
-启动后输出：
-
-```
-🦀 free-agent-gateway v0.1.0
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🌐 free-agent-gateway listening on http://127.0.0.1:9000
-📋 OpenAI-compatible API:  http://127.0.0.1:9000/v1
-🔧 Management API:          http://127.0.0.1:9000/health
-📊 Metrics:                 http://127.0.0.1:9000/metrics
-📈 Prometheus:              http://127.0.0.1:9000/metrics/prometheus
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-## Windows 部署
-
-### 前置条件
-
-1. 安装 [Rust](https://rustup.rs/)（Stable channel）
-2. 确认版本 `rustc --version` >= 1.85
-
-### 构建与部署
-
-```powershell
-# 克隆项目
-git clone <repo-url>
-cd free-agent-gateway
-
-# 编译 Release 版本
-cargo build --release
-
-# 复制产物和配置
-Copy-Item target\release\free-agent-gateway.exe .
-Copy-Item config.yaml .
-
-# 设置环境变量
-$env:GITHUB_TOKEN_1 = "ghp_xxxxxxxxxxxx"
-$env:GITHUB_TOKEN_2 = "ghp_yyyyyyyyyyyy"
-$env:NVIDIA_API_KEY_1 = "nvapi-xxxxxxxxxxxx"
-$env:CEREBRAS_API_KEY = "csk-xxxxxxxxxxxx"
-
-# 启动
-.\free-agent-gateway.exe
-```
-
-## Linux 部署
-
-```bash
-# 安装 Rust（如果尚未安装）
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# 编译
-git clone <repo-url>
-cd free-agent-gateway
-chmod +x scripts/build-linux.sh
-./scripts/build-linux.sh
-
-# 部署
-sudo mkdir -p /etc/free-agent-gateway
-sudo cp dist/free-agent-gateway-linux-*/free-agent-gateway /usr/local/bin/
-sudo cp config.yaml.sample /etc/free-agent-gateway/config.yaml
-
-# 设置环境变量
-export GITHUB_TOKEN_1="ghp_xxxxxxxxxxxx"
-export NVIDIA_API_KEY_1="nvapi-xxxxxxxxxxxx"
-export CEREBRAS_API_KEY="csk-xxxxxxxxxxxx"
-
-# 启动
-free-agent-gateway
-```
-
-运行后产生的 `config.yaml`、`state.json`、`state.db`、`models.cache`、`*.db`、`dist/` 和日志文件都属于本地运行态数据，不应提交到 Git。
-
-## OpenClaw 接入
-
-OpenClaw 只需将 API 地址指向 Gateway：
-
-```yaml
-# OpenClaw 配置
-api:
-  base_url: "http://127.0.0.1:9000/v1"
-  # 使用模型别名（gateway 自动路由到对应 Provider）
-  model: "chat"  # → nvidia / meta/llama-3.1-70b-instruct
-```
-
-也可以在请求头中指定 Agent 名称：
-
-```http
-POST /v1/chat/completions
-X-Agent-Name: openclaw
-```
-
-Gateway 会根据 Agent 名称自动选择对应的默认模型。
-
-## Hermes Agent 接入
-
-```yaml
-# Hermes-Agent 配置
-llm:
-  endpoint: "http://127.0.0.1:9000/v1"
-  model: "coding"  # → github / openai/gpt-4.1-mini
-```
-
-## Curl 测试
-
-### 查看模型列表
+查看模型：
 
 ```bash
 curl http://127.0.0.1:9000/v1/models
 ```
 
-### 模型别名请求
-
-```bash
-# 使用别名 "coding"（自动路由到 GitHub Models / gpt-4.1-mini）
-curl http://127.0.0.1:9000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "coding",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-```
-
-### 流式输出
+普通聊天：
 
 ```bash
 curl http://127.0.0.1:9000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "coding",
-    "messages": [{"role": "user", "content": "Explain Rust ownership"}],
-    "stream": true
+    "model": "auto",
+    "messages": [
+      {"role": "user", "content": "写一个 Rust 版本的快速排序"}
+    ]
   }'
 ```
 
-### Agent 感知请求
+流式输出：
 
 ```bash
 curl http://127.0.0.1:9000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Agent-Name: hermes" \
   -d '{
-    "model": "coding",
-    "messages": [{"role": "user", "content": "Write a fibonacci function"}]
+    "model": "auto",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "解释一下这个项目适合怎么给 Agent 使用"}
+    ]
   }'
 ```
 
-### 健康检查
+指定 provider：
 
-```bash
-curl http://127.0.0.1:9000/health
+```text
+http://127.0.0.1:9000/openrouter/v1/models
+http://127.0.0.1:9000/openrouter/v1/chat/completions
 ```
 
-### 详细指标
+也可以使用配置里的 provider 名称，例如：
 
-```bash
-curl http://127.0.0.1:9000/metrics
+```text
+http://127.0.0.1:9000/groq/v1/chat/completions
+http://127.0.0.1:9000/cerebras/v1/chat/completions
+http://127.0.0.1:9000/huggingface/v1/chat/completions
 ```
 
-### Provider 状态
+## Agent 接入
 
-```bash
-curl http://127.0.0.1:9000/providers
+把任何支持 OpenAI API 的工具指向：
+
+```text
+base_url: http://127.0.0.1:9000/v1
+api_key: 任意非空字符串
+model: auto
 ```
 
-## API 接口
+如果工具支持自定义请求头，可以带上 Agent 名称：
 
-### OpenAI 兼容接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/v1/models` | 列出所有可用模型 |
-| POST | `/v1/chat/completions` | 聊天补全（支持流式） |
-
-### 管理接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/health` | 健康状态 |
-| GET | `/status` | 网关状态 |
-| GET | `/metrics` | 详细指标 |
-| GET | `/metrics/prometheus` | Prometheus 文本格式指标 |
-| GET | `/providers` | Provider 状态列表 |
-| GET | `/admin` | **Admin Dashboard** — 浏览器内建管理面板 |
-| GET | `/admin/status` | Dashboard 数据 API（Provider/Key 实时状态） |
-| GET | `/admin/providers/:name/models` | 单个 Provider 的模型列表及启用状态 |
-| POST | `/admin/providers/:name/refresh` | 刷新 Provider 模型列表 |
-| POST | `/admin/providers/:name/test` | 测试 Provider 连通性 |
-| POST | `/admin/providers/:name/keys/:key_id/restore` | 手工恢复 401/403 禁用的 Key |
-| POST | `/admin/providers/:name/models/:id/toggle` | 启用/禁用模型 |
-| POST | `/admin/save` | 保存模型配置变更 |
-| GET | `/admin/config` | 当前配置（只读） |
-| GET | `/admin/metadata` | 模型元数据统计 |
-| GET | `/admin/metadata/sync` | 元数据同步状态 |
-| GET | `/admin/metadata/models` | 已学习模型列表 |
-| GET | `/admin/metadata/errors` | 错误记录汇总 |
-| GET | `/admin/events` | SSE 实时事件流 |
-
-### 自定义请求头
-
-| 头部 | 说明 |
-|------|------|
-| `X-Agent-Name` | Agent 名称（用于模型路由） |
-| `X-Request-Id` | 自定义请求 ID |
-
-## 项目结构
-
+```http
+X-Agent-Name: codex
 ```
-src/
-├── main.rs              # 入口
-├── lib.rs               # 库根
-├── config.rs            # 配置加载与解析
-├── error.rs             # 统一错误类型
-├── api/
-│   ├── mod.rs           # API 路由注册
-│   ├── chat.rs          # /v1/chat/completions
-│   ├── models.rs        # /v1/models
-│   ├── status.rs        # /health, /status, /metrics, /providers
-│   ├── admin.rs         # Admin Dashboard 后端 API
-│   └── admin_html.rs    # Admin Dashboard HTML/CSS/JS（内嵌单页）
-├── providers/
-│   ├── mod.rs           # Provider 工厂
-│   ├── traits.rs        # Provider trait 定义
-│   ├── github_models.rs # GitHub Models 实现
-│   ├── nvidia.rs        # NVIDIA NIM 实现
-│   ├── openai_compatible.rs  # OpenAI 兼容实现
-│   └── ollama.rs        # Ollama 实现
-├── keyhub/
-│   └── mod.rs           # KeyHub + KeyPool（多 Key 轮换）
-├── router/
-│   └── mod.rs           # 模型路由 + Provider Fallback
-├── watcher/
-│   └── mod.rs           # 后台健康检查任务
-├── health/
-│   └── mod.rs           # 健康状态注册表
-├── models/
-│   └── mod.rs           # 数据模型（OpenAI 兼容格式）
-├── metadata/
-│   ├── mod.rs           # 模型元数据管理
-│   ├── learner.rs       # 模型特征学习
-│   └── sync.rs          # 元数据同步
-└── state/
-    └── mod.rs           # 状态持久化（JSON 文件）
-tests/
-├── provider_tests.rs    # Provider 测试
-├── router_tests.rs      # 路由测试
-├── keyhub_tests.rs      # KeyPool/KeyHub 测试
-└── config_state_health_tests.rs  # 配置/状态/健康测试
+
+网关会根据 agent、任务内容、模型能力、历史错误、key 可用状态和额度压力选择更合适的模型。
+
+## 管理页面
+
+打开：
+
+```text
+http://127.0.0.1:9000/admin
 ```
+
+可以查看：
+
+- 每个 provider 是否可用
+- 每个 key 是否可用、冷却、禁用或待验证
+- 每个模型来自哪些 provider
+- 自动生成的 provider 路由和分组路由
+- token 使用量、请求数、活跃天数和模型占比
+- 近期错误、失败原因和自动切换记录
+- 手动刷新模型、测试 provider、恢复 key
+
+## 常用端点
+
+```text
+GET  /v1/models
+POST /v1/chat/completions
+POST /v1/completions
+POST /v1/responses
+
+GET  /{provider}/v1/models
+POST /{provider}/v1/chat/completions
+
+GET  /admin
+GET  /health
+GET  /status
+GET  /metrics
+GET  /metrics/prometheus
+```
+
+## 给 AI 使用的 Skill
+
+仓库提供了一个可直接给 Codex、Claude Code、OpenCode 或其他 Agent 阅读的技能文件：
+
+```text
+docs/skills/free-agent-gateway/SKILL.md
+```
+
+用途：
+
+- 让 AI 知道应该把 OpenAI API 地址指向 `http://127.0.0.1:9000/v1`
+- 让 AI 默认使用 `model: auto`
+- 让 AI 在需要锁定 provider 时使用 `/{provider}/v1/...`
+- 让 AI 遇到 429、403、模型不存在、空回复、stream 中断时不要自己猜测原因，而是查看管理页状态或错误日志
+- 让 AI 知道 token 统计应包含输入和输出，并区分 provider 上报和本地估算
+
+你可以把这个 `SKILL.md` 复制到自己的 Agent 技能目录，或在 Agent 提示词里引用它。
 
 ## License
 

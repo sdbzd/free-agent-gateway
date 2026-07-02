@@ -78,6 +78,31 @@ fn test_config_parse_from_yaml() {
 }
 
 #[test]
+fn test_config_parse_without_routing_uses_defaults() {
+    let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 9000
+
+providers:
+  github:
+    type: "github_models"
+    enabled: true
+    base_url: "https://models.inference.ai.azure.com"
+    keys:
+      - "gh-key"
+    health_check_model: "openai/gpt-4.1-mini"
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+
+    assert_eq!(config.routing.strategy, RoutingStrategy::LeastFailed);
+    assert_eq!(config.routing.fail_threshold, 3);
+    assert_eq!(config.routing.cooldown_seconds, 600);
+    assert!(config.routing.auto_discover);
+}
+
+#[test]
 fn test_sample_config_parses_and_validates() {
     let yaml = std::fs::read_to_string("config.yaml.sample").unwrap();
     let config = Config::from_str_yaml(&yaml).unwrap();
@@ -282,6 +307,7 @@ fn test_health_registry_register_and_snapshot() {
         provider_type: ProviderType::GithubModels,
         enabled: true,
         base_url: "http://localhost".into(),
+        proxy_url: None,
         keys: vec!["k1".into(), "k2".into()],
         health_check_model: "m".into(),
         timeout_seconds: 30,
@@ -302,6 +328,7 @@ fn test_health_registry_update_healthy() {
         provider_type: ProviderType::GithubModels,
         enabled: true,
         base_url: "http://localhost".into(),
+        proxy_url: None,
         keys: vec!["k1".into()],
         health_check_model: "m".into(),
         timeout_seconds: 30,
@@ -324,6 +351,7 @@ fn test_health_registry_record_error() {
         provider_type: ProviderType::GithubModels,
         enabled: true,
         base_url: "http://localhost".into(),
+        proxy_url: None,
         keys: vec!["k1".into()],
         health_check_model: "m".into(),
         timeout_seconds: 30,
@@ -345,6 +373,7 @@ fn test_health_registry_all_remote_down() {
         provider_type: ProviderType::GithubModels,
         enabled: true,
         base_url: "http://localhost".into(),
+        proxy_url: None,
         keys: vec!["k1".into()],
         health_check_model: "m".into(),
         timeout_seconds: 30,
@@ -354,6 +383,7 @@ fn test_health_registry_all_remote_down() {
         provider_type: ProviderType::Ollama,
         enabled: true,
         base_url: "http://localhost:11434".into(),
+        proxy_url: None,
         keys: vec!["ollama".into()],
         health_check_model: "m".into(),
         timeout_seconds: 120,
@@ -362,12 +392,12 @@ fn test_health_registry_all_remote_down() {
     registry.register("github", &remote_cfg);
     registry.register("ollama", &local_cfg);
 
-    // Both healthy → not all remote down
+    // Both healthy 鈫?not all remote down
     registry.update("github", "healthy", 10, 5, 1, 1);
     registry.update("ollama", "healthy", 10, 5, 1, 1);
     assert!(!registry.all_remote_down());
 
-    // Remote down, local healthy → all remote down is true
+    // Remote down, local healthy 鈫?all remote down is true
     registry.record_error("github", "timeout");
     assert!(registry.all_remote_down());
 }
@@ -487,4 +517,141 @@ providers:
     assert_eq!(provider.keys[0].tier(), KeyTier::Unknown);
     assert!(provider.health_check_model.is_empty());
     assert!(matches!(provider.keys[0], KeyConfig::Legacy(_)));
+}
+
+#[test]
+fn test_huggingface_provider_type_parses() {
+    let yaml = r#"
+server: {}
+routing: {}
+providers:
+  huggingface:
+    type: huggingface
+    base_url: https://router.huggingface.co/v1
+    keys:
+      - value: test-hf-token
+        tier: free
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+    let provider = &config.providers["huggingface"];
+
+    assert_eq!(provider.provider_type, ProviderType::HuggingFace);
+    assert_eq!(provider.base_url, "https://router.huggingface.co/v1");
+    assert!(provider.health_check_model.is_empty());
+}
+
+#[test]
+fn test_adaptive_routing_config_parses() {
+    let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 9000
+routing:
+  auto_discover: true
+fallback: ["openrouter"]
+models: {}
+providers:
+  openrouter:
+    type: "openai_compatible"
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    keys:
+      - value: "test-key"
+        tier: free
+adaptive_routing:
+  enabled: true
+  mode: observe
+  allow_paid: false
+  candidate_limit: 12
+  learning_window_days: 14
+  hard_override_on_capability_mismatch: true
+  auto_models:
+    coding-auto:
+      task: coding
+  agent_profiles:
+    coding_agent:
+      default_auto_model: coding-auto
+      preferred_tasks: ["coding", "tools"]
+      provider_groups: ["coding"]
+  routing_groups:
+    coding:
+      providers: ["openrouter"]
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+
+    let adaptive = config.adaptive_routing;
+    assert!(adaptive.enabled);
+    assert_eq!(
+        adaptive.mode,
+        free_agent_gateway::config::AdaptiveMode::Observe
+    );
+    assert_eq!(adaptive.candidate_limit, 12);
+    assert_eq!(adaptive.learning_window_days, 14);
+    assert_eq!(adaptive.auto_models["coding-auto"].task, "coding");
+    assert_eq!(
+        adaptive.agent_profiles["coding_agent"].preferred_tasks,
+        vec!["coding".to_string(), "tools".to_string()]
+    );
+    assert_eq!(
+        adaptive.routing_groups["coding"].providers,
+        vec!["openrouter".to_string()]
+    );
+}
+
+#[test]
+fn test_adaptive_routing_defaults_are_safe() {
+    let yaml = r#"
+server: {}
+routing: {}
+providers:
+  test:
+    type: openai_compatible
+    base_url: https://example.test/v1
+    keys:
+      - value: test-key
+        tier: free
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+
+    assert!(!config.adaptive_routing.enabled);
+    assert_eq!(
+        config.adaptive_routing.mode,
+        free_agent_gateway::config::AdaptiveMode::Observe
+    );
+    assert!(!config.adaptive_routing.allow_paid);
+    assert_eq!(config.adaptive_routing.candidate_limit, 20);
+    assert_eq!(config.adaptive_routing.learning_window_days, 7);
+}
+
+#[test]
+fn test_context_compression_config_parses_rtk_path() {
+    let yaml = r#"
+server: {}
+routing: {}
+context_compression:
+  enabled: true
+  command: "G:\\ai\\AgentsTools\\rtk.exe"
+  min_message_tokens: 256
+  timeout_seconds: 2
+providers:
+  test:
+    type: openai_compatible
+    base_url: https://example.test/v1
+    keys:
+      - value: test-key
+        tier: free
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+
+    assert!(config.context_compression.enabled);
+    assert_eq!(
+        config.context_compression.command,
+        "G:\\ai\\AgentsTools\\rtk.exe"
+    );
+    assert_eq!(config.context_compression.min_message_tokens, 256);
+    assert_eq!(config.context_compression.timeout_seconds, 2);
 }

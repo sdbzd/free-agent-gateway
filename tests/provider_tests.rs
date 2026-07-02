@@ -13,6 +13,7 @@ fn mock_provider_config(base_url: &str, ptype: ProviderType) -> ProviderConfig {
         provider_type: ptype,
         enabled: true,
         base_url: base_url.into(),
+        proxy_url: None,
         keys: vec!["test-api-key".into()],
         health_check_model: "test-model".into(),
         timeout_seconds: 5,
@@ -230,6 +231,52 @@ async fn test_provider_chat_error_propagation() {
     }
 }
 
+#[tokio::test]
+async fn test_openai_compatible_chat_malformed_success_body_is_upstream_error() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/html")
+        .with_body("<html>temporary upstream page</html>")
+        .create_async()
+        .await;
+
+    let provider = openai_compatible::OpenAiCompatibleProvider::new(
+        "opencode",
+        &mock_provider_config(&server.url(), ProviderType::OpenaiCompatible),
+    );
+
+    let request = ChatCompletionRequest {
+        model: "gpt-4o-mini".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: serde_json::json!("Hi"),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }],
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: None,
+        stop: None,
+        max_tokens: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        user: None,
+        request_id: None,
+        agent_name: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let err = provider.chat("test-key", request).await.unwrap_err();
+    assert_eq!(err.category(), "upstream_error");
+    assert!(err.to_string().contains("non-JSON response from upstream"));
+    assert!(!err.is_auth_failure());
+}
+
 #[test]
 fn test_retry_after_body_fallback_parser() {
     let error = free_agent_gateway::error::GatewayError::http_error(
@@ -241,12 +288,24 @@ fn test_retry_after_body_fallback_parser() {
     assert_eq!(error.retry_after_seconds(), Some(120));
 }
 
+#[test]
+fn test_retry_after_body_fallback_parser_reads_nested_json_fields() {
+    let error = free_agent_gateway::error::GatewayError::http_error(
+        429,
+        r#"{"error":{"message":"rate limited","metadata":{"retry_after":45}}}"#,
+        None,
+    );
+
+    assert_eq!(error.retry_after_seconds(), Some(45));
+}
+
 #[tokio::test]
 async fn test_ollama_provider_construction() {
     let config = ProviderConfig {
         provider_type: ProviderType::Ollama,
         enabled: true,
         base_url: "http://localhost:11434/".into(), // trailing slash should be trimmed
+        proxy_url: None,
         keys: vec!["ollama".into()],
         health_check_model: "".into(),
         timeout_seconds: 120,
@@ -257,6 +316,21 @@ async fn test_ollama_provider_construction() {
     assert_eq!(provider.base_url(), "http://localhost:11434");
     assert_eq!(provider.health_check_model(), "qwen2.5:7b"); // default applied
     assert_eq!(provider.priority(), 100); // default applied
+}
+
+#[test]
+fn test_openai_compatible_provider_does_not_guess_default_health_model() {
+    let mut config = mock_provider_config("http://localhost", ProviderType::OpenaiCompatible);
+    config.health_check_model.clear();
+
+    let groq = openai_compatible::OpenAiCompatibleProvider::new("groq", &config);
+    assert!(groq.health_check_model().is_empty());
+
+    let cerebras = openai_compatible::OpenAiCompatibleProvider::new("Cerebras", &config);
+    assert!(cerebras.health_check_model().is_empty());
+
+    let generic = openai_compatible::OpenAiCompatibleProvider::new("opencode", &config);
+    assert!(generic.health_check_model().is_empty());
 }
 
 #[test]
@@ -276,4 +350,8 @@ fn test_create_provider_factory() {
     let config = mock_provider_config("http://localhost", ProviderType::OpenaiCompatible);
     let provider = create_provider("oc", &config).unwrap();
     assert_eq!(provider.name(), "oc");
+
+    let config = mock_provider_config("http://localhost", ProviderType::HuggingFace);
+    let provider = create_provider("huggingface", &config).unwrap();
+    assert_eq!(provider.name(), "huggingface");
 }

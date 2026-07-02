@@ -4,16 +4,16 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    OpenClaw Ecosystem                         │
+│                OpenClaw / Hermes and Agent Ecosystem          │
 │                                                             │
-│  OpenClaw  │  Hermes-Agent  │  OpenHuman  │  ZeroClaw      │
-│  Coding Agent  │  MCP Agent  │  ...                         │
+│  OpenClaw  │  Hermes-Agent  │  future Agent integrations    │
+│  OpenHuman │  ZeroClaw      │  Coding Agent  │ MCP Agent    │
 └─────────────┬───────────────────────────────────────────────┘
               │
               │  OpenAI Compatible API
               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    OpenClaw Gateway                         │
+│                    free-agent-gateway                         │
 │                                                             │
 │  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐  │
 │  │   API     │  │   KeyHub   │  │  Router   │  │ Watcher  │  │
@@ -28,12 +28,12 @@
 │  └────────────────────────┬──────────────────────────────┘  │
 └───────────────────────────┼─────────────────────────────────┘
                             │
-          ┌─────────────────┼─────────────────┐
-          ▼                 ▼                  ▼
-   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-   │ GitHub Models│  │ NVIDIA NIM   │  │   Ollama     │
-   │  (Azure)     │  │              │  │  (Local)     │
-   └──────────────┘  └──────────────┘  └──────────────┘
+          ┌─────────────────┼─────────────────┬─────────────────┐
+          ▼                 ▼                 ▼                 ▼
+   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+   │ GitHub Models│  │ OpenAI Compat│  │ NVIDIA/Open  │  │   Ollama     │
+   │  (Azure)     │  │Router/Cerebras│ │ Code/etc.    │  │  (Local)     │
+   └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
 ```
 
 ## Core Components
@@ -47,6 +47,7 @@ Implements OpenAI-compatible endpoints:
 - **`GET /health`** — Quick health check
 - **`GET /status`** — Detailed gateway status
 - **`GET /metrics`** — Full metrics dump
+- **`GET /metrics/prometheus`** — Prometheus text-format metrics
 - **`GET /providers`** — Provider-specific status
 - **`GET /admin`** — **Admin Dashboard** (single-page HTML with embedded JS/CSS, served from `admin_html.rs`)
 - **`GET /admin/status`** — Real-time provider + key status for dashboard rendering
@@ -83,7 +84,7 @@ pub trait Provider: Send + Sync + Debug {
 Implementations:
 - **`GithubModelsProvider`** — GitHub Models via Azure
 - **`NvidiaProvider`** — NVIDIA NIM API
-- **`OpenAiCompatibleProvider`** — Generic OpenAI-compatible endpoint
+- **`OpenAiCompatibleProvider`** — Generic OpenAI-compatible endpoint (OpenRouter, Cerebras, OpenCode, etc.)
 - **`OllamaProvider`** — Local Ollama with OpenAI format translation
 
 ### 3. KeyHub (`src/keyhub/`)
@@ -101,15 +102,20 @@ Provider (github)
 
 ```
 Available ──429──→ RateLimited ──cooldown expires──→ Available
-Available ──401/403──→ Disabled (permanent)
+Available ──401/403──→ Disabled ──manual restore──→ Available
 Available ──5xx/timeout──→ fail_count++ ──threshold reached──→ Cooldown
 Cooldown ──cooldown expires──→ Available (fail_count reset)
 ```
+
+401/403 indicates an auth or permission failure, so the gateway never auto-recovers
+that key. Use `POST /admin/providers/:name/keys/:key_id/restore` (or the Restore
+button in Admin) after fixing the key/provider issue.
 
 **Routing Strategies:**
 - **RoundRobin** — Cycle through keys sequentially
 - **Random** — Random selection
 - **LeastFailed** — Prefer key with fewest failures
+- **LeastRate** — Prefer the key/provider with the most remaining local quota headroom
 - **Priority** — Use first available key
 
 ### 4. Router (`src/router/`)
@@ -122,15 +128,15 @@ Request: model="coding", agent="hermes"
     ▼
 1. Agent default → "coding" is hermes' default model
 2. Alias lookup → "coding" → github / openai/gpt-4.1-mini
-3. Fallback chain → [github, nvidia, ollama]
+3. Cross-provider same-model candidate pool → [github, nvidia, cerebras, ollama]
     │
     ▼
-Try github → 429 → KeyPool rate-limits key → try nvidia → 500 → try ollama → ✅
+Reserve key quota → try provider → 429 → KeyPool rate-limits key → try next candidate → ✅
 ```
 
 **Streaming token usage extraction:**
 - `account_stream()` buffers the last SSE chunk; on stream completion it calls `extract_stream_usage()` to parse `usage.prompt_tokens` / `usage.completion_tokens` from the final chunk
-- Tokens are forwarded to `KeyPool.report_success()` for accurate rate-limit tracking (TPM/TPD)
+- Requests are pre-reserved before upstream calls for RPM/RPD protection; tokens are forwarded on success for TPM/TPD tracking
 
 **Resolution order:**
 1. Agent default model (if agent name provided)
@@ -208,11 +214,12 @@ Router.resolve(model, agent) → ResolvedRoute { provider, model }
     │
     ▼
 For each provider in fallback chain:
-    ├─ KeyPool.acquire_key() → select best key
+    ├─ Router builds cross-provider same-model candidate pool
+    ├─ KeyHub.reserve_key() → pre-reserve RPM/RPD before upstream call
     ├─ Provider.chat() / Provider.chat_stream()
-    │   ├─ Success → KeyPool.report_success() → return response
+    │   ├─ Success → KeyPool.report_reserved_success() → return response
     │   └─ Failure → KeyPool.report_failure(status_code)
-    │       ├─ 429 → RateLimited (cooldown 10 min)
+    │       ├─ 429 → RateLimited (Retry-After header/body if available, otherwise local backoff)
     │       ├─ 401/403 → Disabled (permanent)
     │       └─ 5xx/timeout → fail_count++
     │           └─ threshold reached → Cooldown

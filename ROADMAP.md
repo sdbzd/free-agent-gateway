@@ -7,7 +7,7 @@
 - [x] OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`)
 - [x] Provider abstraction (GitHub Models, NVIDIA NIM, OpenAI-compatible, Ollama)
 - [x] KeyHub — multi-key rotation per provider
-- [x] Routing strategies (RoundRobin, Random, LeastFailed, Priority)
+- [x] Routing strategies (RoundRobin, Random, LeastFailed, LeastRate, Priority)
 - [x] Automatic fault tolerance (429 → RateLimited, 401/403 → Disabled, 5xx → Cooldown)
 - [x] Provider fallback chain
 - [x] Agent-aware routing
@@ -23,7 +23,8 @@
 ## v0.2 — Enhanced Reliability
 
 - [ ] Smart model discovery cache with TTL
-- [ ] Exponential backoff on provider errors
+- [x] Retry-After tolerant 429 backoff (header, body fallback, local escalation)
+- [x] Per-key RPM/RPD pre-reservation before upstream calls
 - [ ] Circuit breaker pattern (half-open state for recovery probing)
 - [ ] Request deduplication
 - [ ] Per-model rate limiting
@@ -34,12 +35,13 @@
 
 - [x] **Admin Dashboard** — In-browser single-page HTML served at `/admin`, with Provider/Key/Model status, exhausted alerts, smart polling, cooldown countdown, real-time event stream
 - [x] **Chat Test** — In-browser provider/key/model chat testing with streaming support
-- [ ] Prometheus metrics endpoint (`/metrics/prometheus`)
+- [x] Prometheus metrics endpoint (`/metrics/prometheus`)
 - [ ] Structured JSON logging mode
 - [ ] Request tracing (OpenTelemetry compatible)
 
 ## v0.4 — Advanced Routing
 
+- [x] Cross-provider same-model candidate pooling
 - [ ] Per-model cost-based routing
 - [ ] Latency-aware routing (route to fastest responding provider)
 - [ ] Geographic routing (prefer closer providers)
