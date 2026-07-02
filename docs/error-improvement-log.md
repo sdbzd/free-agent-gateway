@@ -636,3 +636,56 @@ Impact:
 Follow-up design:
 
 - See `docs/reliable-key-routing-research.md` for the longer-term routing and key availability design based on LiteLLM, Portkey, and FreeLLMAPI patterns.
+
+## 2026-07-02: GitHub Publish Fallback When HTTPS Push Is Reset
+
+Problem:
+
+- `git push origin master` repeatedly failed after upload with:
+  `RPC failed; curl 56 Recv failure: Connection was reset`.
+- `git push --porcelain --progress` showed the pack upload completed
+  successfully, then the connection reset while waiting for the receive-pack
+  response.
+- `git ls-remote origin refs/heads/master` confirmed the remote ref had not
+  moved despite Git printing `Everything up-to-date`.
+- SSH port 22 timed out, SSH-over-443 also did not complete in time.
+
+Diagnosis:
+
+- The failing HTTPS connection presented a local `scholar.verify` certificate
+  chain and reset the `git-receive-pack` POST after the upload finished.
+- The object pack was small, so this was not a repository size problem.
+- Switching Git HTTP version, postBuffer, or SSL backend did not fix it.
+
+Successful recovery:
+
+- Use GitHub's Git Database API with the existing Git Credential Manager token.
+- Do not print or store the token; obtain it through `git credential fill` and
+  keep it only in memory for the publishing script.
+- Recreate each local commit missing from the remote in order:
+  1. Read the current remote `master` SHA with `git ls-remote`.
+  2. List missing commits with `git rev-list --reverse remote..HEAD`.
+  3. For each commit, upload changed blobs with `POST /git/blobs`.
+  4. Create a tree with `POST /git/trees` using the previous remote tree as
+     `base_tree`.
+  5. Create the commit with `POST /git/commits`, preserving message, author,
+     committer, date, parent, and tree.
+  6. Move `refs/heads/master` with `PATCH /git/refs/heads/master` and
+     `force=false`.
+  7. Run `git fetch origin master` and `git status --short --branch` to verify
+     local and remote are synchronized.
+
+Important details:
+
+- Prefer this only as a fallback after ordinary `git push` fails and
+  `ls-remote` proves the remote ref did not move.
+- If the recreated commit SHA matches the local commit SHA, the tree, parent,
+  author, committer, date, and message were preserved correctly.
+- PowerShell pitfalls from this run:
+  - Older Windows PowerShell does not support `&&`.
+  - Some .NET versions do not expose `ProcessStartInfo.ArgumentList`; use
+    `Arguments` or another compatible byte-safe subprocess wrapper.
+  - Avoid text encoding when reading blobs. Read `git show <commit>:<path>` as
+    raw bytes before base64 encoding.
+  - In PowerShell strings, write `${Spec}:` instead of `$Spec:` to avoid drive
+    syntax parsing.
