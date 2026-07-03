@@ -111,10 +111,7 @@ impl Provider for OpenAiCompatibleProvider {
         if !resp.status().is_success() {
             let retry_after_seconds = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            if matches!(status, 404 | 405)
-                && !self.health_check_model.trim().is_empty()
-                && body.contains("GET not supported")
-            {
+            if matches!(status, 404 | 405) && !self.health_check_model.trim().is_empty() {
                 if let Some(models_url) = cloudflare_models_search_url(&self.base_url) {
                     match fetch_cloudflare_models(
                         &client,

@@ -176,6 +176,35 @@ async fn test_cloudflare_models_405_uses_models_search() {
 }
 
 #[tokio::test]
+async fn test_cloudflare_models_405_without_expected_body_still_uses_models_search() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/client/v4/accounts/test-account/ai/v1/models")
+        .with_status(405)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":false,"errors":[]}"#)
+        .create_async()
+        .await;
+    let search = server
+        .mock("GET", "/client/v4/accounts/test-account/ai/models/search")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"result":[{"name":"@cf/openai/gpt-oss-20b"}]}"#)
+        .create_async()
+        .await;
+
+    let base_url = format!("{}/client/v4/accounts/test-account/ai/v1", server.url());
+    let provider = openai_compatible::OpenAiCompatibleProvider::new(
+        "cloudflare",
+        &mock_provider_config(&base_url, ProviderType::OpenaiCompatible),
+    );
+
+    let models = provider.list_models("test-key").await.unwrap();
+    assert_eq!(models, vec!["@cf/openai/gpt-oss-20b".to_string()]);
+    search.assert_async().await;
+}
+
+#[tokio::test]
 async fn test_provider_chat_error_propagation() {
     let mut server = mockito::Server::new_async().await;
     server

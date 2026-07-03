@@ -1074,15 +1074,62 @@ impl KeyHub {
             .unwrap_or_default()
     }
 
+    pub fn model_probe_keys(&self, provider_name: &str) -> Vec<(String, KeyTier)> {
+        self.pools
+            .get(provider_name)
+            .map(|pool| {
+                let now = chrono::Utc::now().timestamp() as u64;
+                let mut keys = pool.keys.write();
+                pool.recover_expired(&mut keys);
+                for key in keys.iter_mut() {
+                    key.reset_rate_windows(now);
+                }
+                keys.iter()
+                    .filter(|key| {
+                        (key.status == KeyStatus::Available && !key.is_rate_limited(now))
+                            || key.status == KeyStatus::Disabled
+                    })
+                    .map(|key| (key.key.clone(), key.tier))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn key_status(&self, provider_name: &str, key: &str) -> Option<KeyStatus> {
+        self.pools.get(provider_name).and_then(|pool| {
+            pool.keys
+                .read()
+                .iter()
+                .find(|state| state.key == key)
+                .map(|state| state.status)
+        })
+    }
+
     pub fn update_models(&self, provider_name: &str, key: &str, mut models: Vec<String>) {
         models.sort();
         models.dedup();
         if let Some(pool) = self.pools.get(provider_name) {
             let mut keys = pool.keys.write();
             if let Some(state) = keys.iter_mut().find(|state| state.key == key) {
+                let should_recover_disabled =
+                    state.status == KeyStatus::Disabled && !models.is_empty();
                 state.models = models;
-                state.models_updated_at = Some(chrono::Utc::now().timestamp());
+                let now = chrono::Utc::now().timestamp();
+                state.models_updated_at = Some(now);
                 state.models_last_error.clear();
+                if should_recover_disabled {
+                    state.status = KeyStatus::Available;
+                    state.fail_count = 0;
+                    state.cooldown_until = None;
+                    state.status_updated_at = Some(now as u64);
+                    state.last_recovered_at = Some(now as u64);
+                    tracing::info!(
+                        provider = %provider_name,
+                        key = %state.masked_key(),
+                        stage = "model_discovery_recovery",
+                        "Key restored after successful model discovery"
+                    );
+                }
             }
         }
     }

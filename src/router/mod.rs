@@ -769,11 +769,21 @@ impl Router {
         let mut last_error: Option<GatewayError> = None;
         let attempt_count = candidates.len();
         let mut last_provider: Option<String> = None;
+        let mut invalid_provider_models: HashSet<(String, String)> = HashSet::new();
 
         for (attempt_index, candidate) in candidates.into_iter().enumerate() {
             let provider_name = candidate.provider;
             let api_key = candidate.key;
             let upstream_model = candidate.model;
+            if invalid_provider_models.contains(&(provider_name.clone(), upstream_model.clone())) {
+                tracing::debug!(
+                    request_id,
+                    provider = %provider_name,
+                    model = %upstream_model,
+                    "Skipping candidate after provider reported model is invalid"
+                );
+                continue;
+            }
             let provider = match self.providers.get(&provider_name) {
                 Some(p) => p,
                 None => {
@@ -934,6 +944,10 @@ impl Router {
                         Some(self.config.routing.cooldown_seconds as i64),
                         attempt_index + 1 < attempt_count,
                     );
+                    if is_provider_model_mismatch(&e) {
+                        invalid_provider_models
+                            .insert((provider_name.clone(), upstream_model.clone()));
+                    }
                     last_provider = Some(provider_name.clone());
                     tracing::warn!(
                         request_id,
@@ -1334,11 +1348,21 @@ impl Router {
         let mut last_error: Option<GatewayError> = None;
         let attempt_count = candidates.len();
         let mut last_provider: Option<String> = None;
+        let mut invalid_provider_models: HashSet<(String, String)> = HashSet::new();
 
         for (attempt_index, candidate) in candidates.into_iter().enumerate() {
             let provider_name = candidate.provider;
             let api_key = candidate.key;
             let upstream_model = candidate.model;
+            if invalid_provider_models.contains(&(provider_name.clone(), upstream_model.clone())) {
+                tracing::debug!(
+                    request_id,
+                    provider = %provider_name,
+                    model = %upstream_model,
+                    "Skipping stream candidate after provider reported model is invalid"
+                );
+                continue;
+            }
             let provider = match self.providers.get(&provider_name) {
                 Some(p) => p,
                 None => continue,
@@ -1378,20 +1402,6 @@ impl Router {
             let result: GatewayResult<StreamResponse> = provider.chat_stream(&api_key, req).await;
             match result {
                 Ok(response) => {
-                    record_request_attempt(
-                        &self.model_meta,
-                        request_id,
-                        (attempt_index + 1) as i64,
-                        &provider_name,
-                        &upstream_model,
-                        &api_key,
-                        true,
-                        "success",
-                        None,
-                        None,
-                        None,
-                        false,
-                    );
                     tracing::info!(
                         request_id,
                         provider = %provider_name,
@@ -1442,6 +1452,10 @@ impl Router {
                         Some(self.config.routing.cooldown_seconds as i64),
                         attempt_index + 1 < attempt_count,
                     );
+                    if is_provider_model_mismatch(&e) {
+                        invalid_provider_models
+                            .insert((provider_name.clone(), upstream_model.clone()));
+                    }
                     last_provider = Some(provider_name.clone());
                     tracing::warn!(
                         request_id,
@@ -1507,20 +1521,6 @@ impl Router {
 
                 match emergency_provider.chat_stream(&emergency_key, req).await {
                     Ok(response) => {
-                        record_request_attempt(
-                            &self.model_meta,
-                            request_id,
-                            (attempt_count + 1) as i64,
-                            &provider,
-                            &upstream_model,
-                            &emergency_key,
-                            true,
-                            "success",
-                            None,
-                            None,
-                            None,
-                            false,
-                        );
                         tracing::info!(
                             request_id,
                             provider = %provider,
@@ -1601,20 +1601,6 @@ impl Router {
 
                     match emergency_provider.chat_stream(&paid_key, req).await {
                         Ok(response) => {
-                            record_request_attempt(
-                                &self.model_meta,
-                                request_id,
-                                (attempt_count + 2) as i64,
-                                provider,
-                                &upstream_model,
-                                &paid_key,
-                                true,
-                                "success",
-                                None,
-                                None,
-                                None,
-                                false,
-                            );
                             tracing::info!(
                                 request_id,
                                 provider = %provider,
@@ -2123,6 +2109,20 @@ fn account_stream(
                     ct,
                     tokens_reported,
                 );
+                record_request_attempt(
+                    &state.model_meta,
+                    &state.request_id,
+                    state.attempt_index,
+                    &state.provider_name,
+                    &state.model,
+                    &state.api_key,
+                    true,
+                    "success",
+                    None,
+                    None,
+                    None,
+                    false,
+                );
                 tracing::info!(
                     request_id = %state.request_id,
                     provider = %state.provider_name,
@@ -2137,6 +2137,10 @@ fn account_stream(
             }
         }
     }))
+}
+
+fn is_provider_model_mismatch(error: &GatewayError) -> bool {
+    matches!(error.category(), "model_not_found" | "model_forbidden")
 }
 
 fn mask_key(key: &str) -> String {

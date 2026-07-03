@@ -182,7 +182,7 @@ For any service implementing the OpenAI API:
   opencode:
     type: "openai_compatible"
     enabled: true
-    base_url: "https://api.opencode.ai/v1"
+    base_url: "https://opencode.ai/zen/v1"
     keys:
       - "${OPENCODE_API_KEY}"
     health_check_model: "gpt-4o-mini"

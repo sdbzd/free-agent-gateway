@@ -444,8 +444,8 @@ fn test_persisted_state_restores_only_matching_configured_keys() {
     };
     let source = KeyHub::new(routing.clone());
     source.register_provider("github", vec!["key-a".into()]);
-    source.report_failure("github", "key-a", 401);
     source.update_models("github", "key-a", vec!["model-a".into()]);
+    source.report_failure("github", "key-a", 401);
     let persisted = source.snapshot().remove(0).1;
 
     let restored = KeyHub::new(routing);

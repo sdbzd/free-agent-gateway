@@ -689,3 +689,48 @@ Important details:
     raw bytes before base64 encoding.
   - In PowerShell strings, write `${Spec}:` instead of `$Spec:` to avoid drive
     syntax parsing.
+
+## 2026-07-03: Provider Health False Negatives And Disabled-Key Recheck
+
+Problem:
+
+- `opencode` health showed `non-JSON response ... body_preview=Not Found`
+  even though daily usage was low and all keys were still present.
+- `groq` and `Cerebras` were shown as disabled/unhealthy, but direct
+  provider `/models` checks returned HTTP 200 for every configured key.
+- `Cloudflare` could return 405 from OpenAI-compatible `/models`; the real
+  inventory endpoint is Cloudflare's `/ai/models/search`.
+- `/health` could show stale available-key counts on error, which conflicted
+  with `/admin/status`.
+
+Diagnosis:
+
+- The local `opencode` base URL still used the stale `api.opencode.ai` host;
+  `https://opencode.ai/zen/v1/models` returned a normal JSON model list.
+- Old 401/403 state could be persisted as `disabled`; because disabled keys
+  were skipped by model discovery, a later valid `/models` response could not
+  restore them automatically.
+- Cloudflare fallback depended on a specific 405 body string, but the provider
+  does not guarantee that exact message.
+
+Changes:
+
+- Updated the opencode example/base URL to `https://opencode.ai/zen/v1`.
+- Added model-discovery probes for disabled keys in watcher/admin refresh.
+  Successful non-empty model discovery restores a disabled key to available.
+- Kept normal routing `discovery_keys` semantics unchanged; added a separate
+  `model_probe_keys` path for health/model refresh.
+- Updated health error recording so `/health` refreshes available/total key
+  counts even when the provider is unhealthy.
+- Changed Cloudflare 404/405 model discovery fallback to try
+  `/ai/models/search` whenever the Cloudflare account URL can be derived,
+  independent of the exact error body.
+
+Verification:
+
+- Direct checks: `groq` 2/2 keys returned `/models` 200, `Cerebras` 2/2 keys
+  returned `/models` 200, `agnes_ai` returned 200, `nvidia` 4/4 keys returned
+  200, and Cloudflare `/ai/models/search` returned 200.
+- `cargo test` passed using an isolated target directory because the running
+  service locked the default Windows build output.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.

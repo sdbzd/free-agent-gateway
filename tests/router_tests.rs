@@ -15,6 +15,7 @@ use free_agent_gateway::config::{
 };
 use free_agent_gateway::error::{GatewayError, GatewayResult};
 use free_agent_gateway::keyhub::{KeyHub, key_fingerprint};
+use free_agent_gateway::metadata::ModelMetaStore;
 use free_agent_gateway::models::{ChatCompletionRequest, ChatMessage, KeyStatus};
 use free_agent_gateway::providers::BoxedProvider;
 use free_agent_gateway::providers::openai_compatible::OpenAiCompatibleProvider;
@@ -209,6 +210,12 @@ struct StaticStreamProvider {
 }
 
 #[derive(Debug)]
+struct InvalidModelProvider {
+    name: String,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[derive(Debug)]
 struct DiscoveryFailProvider {
     name: String,
 }
@@ -353,6 +360,69 @@ impl Provider for StaticStreamProvider {
 
     fn health_check_model(&self) -> &str {
         "test-model"
+    }
+
+    fn timeout_seconds(&self) -> u64 {
+        5
+    }
+
+    fn priority(&self) -> u32 {
+        0
+    }
+}
+
+#[async_trait]
+impl Provider for InvalidModelProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "http://invalid-model"
+    }
+
+    async fn list_models(&self, _api_key: &str) -> GatewayResult<Vec<String>> {
+        Ok(vec![])
+    }
+
+    async fn chat(
+        &self,
+        api_key: &str,
+        request: ChatCompletionRequest,
+    ) -> GatewayResult<ChatResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((api_key.to_string(), request.model.clone()));
+        Err(GatewayError::http_error(
+            400,
+            format!("{} is not a valid model ID", request.model),
+            None,
+        ))
+    }
+
+    async fn chat_stream(
+        &self,
+        api_key: &str,
+        request: ChatCompletionRequest,
+    ) -> GatewayResult<StreamResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((api_key.to_string(), request.model.clone()));
+        Err(GatewayError::http_error(
+            400,
+            format!("{} is not a valid model ID", request.model),
+            None,
+        ))
+    }
+
+    async fn health_check(&self, _api_key: &str) -> GatewayResult<u64> {
+        Ok(1)
+    }
+
+    fn health_check_model(&self) -> &str {
+        "wrong-fallback-model"
     }
 
     fn timeout_seconds(&self) -> u64 {
@@ -1139,6 +1209,74 @@ async fn test_rate_limited_key_is_removed_and_next_key_takes_over() {
 }
 
 #[tokio::test]
+async fn test_invalid_model_id_does_not_fan_out_across_same_provider_keys() {
+    let mut config = make_config();
+    config.fallback = vec!["openrouter".into()];
+    config.providers.insert(
+        "openrouter".into(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenaiCompatible,
+            enabled: true,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            proxy_url: None,
+            keys: vec![
+                KeyConfig::detailed("or-key-1", KeyTier::Free),
+                KeyConfig::detailed("or-key-2", KeyTier::Free),
+            ],
+            health_check_model: "deepseek-ai/deepseek-v4-flash:free".into(),
+            timeout_seconds: 30,
+            priority: 0,
+        },
+    );
+
+    let config = Arc::new(config);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "openrouter".into(),
+        Box::new(InvalidModelProvider {
+            name: "openrouter".into(),
+            calls: calls.clone(),
+        }) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider(
+        "openrouter",
+        vec![
+            KeyConfig::detailed("or-key-1", KeyTier::Free),
+            KeyConfig::detailed("or-key-2", KeyTier::Free),
+        ],
+    );
+    keyhub.update_models(
+        "openrouter",
+        "or-key-1",
+        vec!["deepseek-ai/deepseek-v4-flash:free".into()],
+    );
+    keyhub.update_models(
+        "openrouter",
+        "or-key-2",
+        vec!["deepseek-ai/deepseek-v4-flash:free".into()],
+    );
+    let router = build_router(config, providers, keyhub.clone());
+
+    let result = router
+        .chat(&chat_request("deepseek-ai/deepseek-v4-flash:free", false))
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[(
+            "or-key-1".to_string(),
+            "deepseek-ai/deepseek-v4-flash:free".to_string()
+        )]
+    );
+    let mut snapshot = keyhub.snapshot();
+    let keys = snapshot.remove(0).1;
+    assert!(keys.iter().all(|key| key.status == KeyStatus::Available));
+}
+
+#[tokio::test]
 async fn test_stream_success_is_recorded_only_after_body_completes() {
     let mut config = make_config();
     config.fallback = vec!["streamer".into()];
@@ -1175,6 +1313,63 @@ async fn test_stream_success_is_recorded_only_after_body_completes() {
     let after = keyhub.snapshot().remove(0).1.remove(0);
     assert_eq!(after.success_count, 1);
     assert_eq!(after.total_fail_count, 0);
+}
+
+#[tokio::test]
+async fn test_stream_attempt_metadata_success_waits_for_body_completion() {
+    let path = std::env::temp_dir().join(format!(
+        "free-agent-gateway-stream-attempts-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let meta = ModelMetaStore::open(&path).unwrap();
+    let mut config = make_config();
+    config.fallback = vec!["streamer".into()];
+    config.models.insert(
+        "stream-test".into(),
+        ModelAlias {
+            provider: "streamer".into(),
+            model: "test-model".into(),
+        },
+    );
+    let config = Arc::new(config);
+    let providers = Arc::new(DashMap::new());
+    providers.insert(
+        "streamer".into(),
+        Box::new(TestStreamProvider {
+            name: "streamer".into(),
+            fail_in_body: true,
+        }) as BoxedProvider,
+    );
+    let keyhub = Arc::new(KeyHub::new(config.routing.clone()));
+    keyhub.register_provider("streamer", vec![tiered_key("stream-key", KeyTier::Free)]);
+    keyhub.update_models("streamer", "stream-key", vec!["test-model".into()]);
+    let router = Router::new(
+        config,
+        providers,
+        keyhub,
+        Arc::new(RwLock::new(HashMap::new())),
+        Some(meta.clone()),
+    );
+
+    let results: Vec<_> = router
+        .chat_stream(&chat_request("stream-test", true))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    assert!(results.iter().any(Result::is_err));
+    let attempts = meta.get_recent_attempts(10).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert!(!attempts[0].success);
+    assert_eq!(
+        attempts[0].error_category.as_deref(),
+        Some("upstream_error")
+    );
+
+    drop(meta);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

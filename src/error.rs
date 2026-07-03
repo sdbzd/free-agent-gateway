@@ -248,6 +248,11 @@ impl GatewayError {
                 ..
             } if is_model_forbidden(message) => "model_forbidden",
             Self::HttpError { status: 403, .. } => "auth_failed",
+            Self::HttpError {
+                status: 400,
+                message,
+                ..
+            } if is_invalid_model_id(message) => "model_not_found",
             Self::HttpError { status: 503, .. } => "upstream_error",
             Self::HttpError { .. } => "upstream_http_error",
             Self::Timeout(_) => "timeout",
@@ -295,6 +300,14 @@ pub fn is_model_forbidden(message: &str) -> bool {
         || lower.contains("model_not_found")
         || lower.contains("does not have access to model")
         || lower.contains("not authorized for model")
+}
+
+pub fn is_invalid_model_id(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not a valid model id")
+        || lower.contains("invalid model id")
+        || lower.contains("model id is invalid")
+        || lower.contains("unknown model")
 }
 
 pub fn is_malformed_stream_error(message: &str) -> bool {

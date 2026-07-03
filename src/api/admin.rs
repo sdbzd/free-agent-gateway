@@ -19,6 +19,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::AppState;
 use crate::keyhub::key_fingerprint;
 use crate::metadata::ModelMetaStore;
+use crate::models::KeyStatus;
 use crate::providers::traits::{ChatResponse, Provider};
 
 /// GET /admin/config — Return masked configuration.
@@ -299,8 +300,17 @@ pub async fn admin_provider_refresh(
     let mut provider_models = std::collections::BTreeSet::new();
     let mut last_error = String::new();
 
-    for (api_key, _tier) in state.keyhub.discovery_keys(&provider_name) {
-        if !state.keyhub.reserve_key(&provider_name, &api_key) {
+    for (api_key, _tier) in state.keyhub.model_probe_keys(&provider_name) {
+        let is_disabled_probe = matches!(
+            state.keyhub.key_status(&provider_name, &api_key),
+            Some(KeyStatus::Disabled)
+        );
+        let reserved = if is_disabled_probe {
+            false
+        } else {
+            state.keyhub.reserve_key(&provider_name, &api_key)
+        };
+        if !reserved && !is_disabled_probe {
             continue;
         }
         let started = Instant::now();
@@ -310,9 +320,11 @@ pub async fn admin_provider_refresh(
                 successful_keys += 1;
                 provider_models.extend(models.iter().cloned());
                 state.keyhub.update_models(&provider_name, &api_key, models);
-                state
-                    .keyhub
-                    .report_reserved_success(&provider_name, &api_key, None, None);
+                if reserved {
+                    state
+                        .keyhub
+                        .report_reserved_success(&provider_name, &api_key, None, None);
+                }
             }
             Ok(Err(error)) => {
                 state
@@ -353,13 +365,15 @@ pub async fn admin_provider_refresh(
             total,
         );
     } else {
-        state.health_registry.record_error(
+        state.health_registry.record_error_with_counts(
             &provider_name,
             if last_error.is_empty() {
                 "No configured keys"
             } else {
                 &last_error
             },
+            available,
+            total,
         );
     }
 
