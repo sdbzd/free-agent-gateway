@@ -290,10 +290,11 @@ mod tests {
             _request: ChatCompletionRequest,
         ) -> GatewayResult<ChatResponse> {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            Ok(ChatResponse {
-                body: serde_json::json!({"id": "too-late"}),
-                status: 200,
-            })
+            Ok(ChatResponse::new(
+                serde_json::json!({"id": "too-late"}),
+                200,
+                None,
+            ))
         }
 
         async fn chat_stream(
@@ -356,12 +357,14 @@ mod tests {
                     model: "slow-model".into(),
                 },
             )]),
+            model_fallbacks: HashMap::new(),
             providers: HashMap::from([("slow".into(), provider_config)]),
             watcher: WatcherConfig::default(),
             state: StateConfig::default(),
             cors: CorsConfig::default(),
             adaptive_routing: Default::default(),
             context_compression: Default::default(),
+            logging: Default::default(),
         });
         let providers = Arc::new(DashMap::new());
         providers.insert(

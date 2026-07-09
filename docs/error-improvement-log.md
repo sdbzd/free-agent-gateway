@@ -734,3 +734,44 @@ Verification:
 - `cargo test` passed using an isolated target directory because the running
   service locked the default Windows build output.
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
+
+## 2026-07-09: Day-Long Call Failures And Strict Provider Compatibility
+
+Problem:
+
+- A day of gateway usage produced frequent fallback attempts and visible
+  upstream errors.
+- A single request could burn many attempts before eventually succeeding.
+
+Diagnosis:
+
+- Runtime logs and `state.db.request_attempts` showed the dominant causes:
+  - invalid concrete model IDs, especially OpenRouter `*:free` slugs that were
+    not accepted by OpenRouter;
+  - OpenRouter free upstream 429s;
+  - OpenCode 401 `CreditsError` responses for workspaces without payment
+    method;
+  - strict OpenAI-compatible providers such as Groq and Cerebras rejecting the
+    non-standard `thinking` request field;
+  - Agnes rejecting requests with `max_tokens` above `65536`;
+  - occasional Cloudflare empty completions or model-name mismatches.
+- Existing metadata error classification still treated some invalid-model 400s
+  as generic `other`/upstream failures, making the learning signal weaker than
+  the router's `GatewayError` category.
+
+Changes:
+
+- OpenAI-compatible providers now strip `thinking` before forwarding upstream.
+- OpenAI-compatible providers now clamp `max_tokens > 65536` to `65536`.
+- Metadata error classification now records invalid-model diagnostics such as
+  `not a valid model ID`, `invalid model ID`, `unknown model`, `No such model`,
+  and `model_not_found` as `not_found`.
+- Updated adaptive routing docs to describe request normalization and
+  invalid-model learning.
+
+Verification:
+
+- `cargo test --target-dir target\codex-check --test provider_tests` passed.
+- `cargo test --target-dir target\codex-check --test metadata_learning_tests`
+  passed.
+- `cargo test --target-dir target\codex-check --test keyhub_tests` passed.

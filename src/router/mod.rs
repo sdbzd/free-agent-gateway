@@ -18,9 +18,9 @@ use tokio::io::AsyncWriteExt;
 
 use bytes::Bytes;
 
-use crate::config::{Config, KeyTier, RoutingStrategy};
+use crate::config::{Config, KeyTier, ModelAlias, RoutingStrategy};
 use crate::error::{GatewayError, GatewayResult, sanitize_diagnostic};
-use crate::keyhub::{KeyHub, key_fingerprint};
+use crate::keyhub::{KeyHub, REAL_MODEL_RECOVERY_COOLDOWN_S, key_fingerprint};
 use crate::metadata::{DeploymentStateRow, ModelMetaStore};
 use crate::models::{ChatCompletionRequest, ChatMessage};
 use crate::providers::BoxedProvider;
@@ -90,6 +90,58 @@ fn record_request_attempt(
     }
 }
 
+fn real_model_key_cooldown_reason(error: &GatewayError) -> Option<&'static str> {
+    match error.category() {
+        "model_forbidden" | "region_forbidden" | "waf_blocked" | "model_not_found"
+        | "auth_failed" => return None,
+        "rate_limited" => return Some("real_model_rate_limited"),
+        _ => {}
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("daily")
+        || message.contains("per day")
+        || message.contains("requests per day")
+        || message.contains("rpd")
+        || message.contains("quota exhausted")
+        || message.contains("quota exceeded")
+        || message.contains("free quota")
+        || message.contains("free pool")
+        || message.contains("free tier")
+        || message.contains("insufficient balance")
+        || message.contains("no credits")
+        || message.contains("credits exhausted")
+        || message.contains("billing")
+        || message.contains("temporarily unavailable")
+        || message.contains("capacity")
+    {
+        return Some("real_model_unavailable");
+    }
+
+    None
+}
+
+fn report_real_model_key_cooldown(
+    keyhub: &KeyHub,
+    provider: &str,
+    key: &str,
+    model: &str,
+    error: &GatewayError,
+) -> Option<i64> {
+    let reason = real_model_key_cooldown_reason(error)?;
+    let retry_after = error.retry_after_seconds();
+    let cooldown_s = retry_after.unwrap_or(REAL_MODEL_RECOVERY_COOLDOWN_S);
+    keyhub.report_real_model_failure(
+        provider,
+        key,
+        error.http_status(),
+        model,
+        reason,
+        retry_after,
+    );
+    Some(cooldown_s as i64)
+}
+
 /// A resolved route: which provider and model to use.
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
@@ -102,8 +154,9 @@ struct RouteCandidate {
     provider: String,
     key: String,
     model: String,
+    model_index: usize,
     provider_index: usize,
-    usage_sort_key: (u32, u32, u32, u32, u32),
+    usage_sort_key: (u32, u32, u32, u32, u32, u32),
     fail_count: u32,
     total_fail_count: u64,
     deployment_penalty: u32,
@@ -213,15 +266,98 @@ fn has_openrouter_suffix(model: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_openrouter_native_model(model: &str) -> bool {
-    has_openrouter_suffix(model)
+fn is_openrouter_aggregate_model(model: &str) -> bool {
+    matches!(
+        model.to_ascii_lowercase().as_str(),
+        "openrouter/free" | "openrouter/auto" | "openrouter/fusion" | "openrouter/bodybuilder"
+    )
 }
 
 fn candidate_model_ids(model: &str) -> Vec<String> {
+    if is_openrouter_aggregate_model(model) {
+        return vec![model.to_string()];
+    }
     if has_openrouter_suffix(model) {
         return vec![model.to_string()];
     }
+    // Cloudflare Workers AI models start with @cf/ and are not available
+    // on OpenRouter. Adding :free suffix would create false OpenRouter
+    // candidates that fail and prevent Cloudflare from being reached.
+    if model.starts_with("@cf/") {
+        return vec![model.to_string()];
+    }
     vec![model.to_string(), format!("{model}:free")]
+}
+
+fn push_candidate_models(
+    models: &mut Vec<(String, usize)>,
+    seen: &mut HashSet<String>,
+    model: &str,
+    model_index: usize,
+) {
+    for candidate in candidate_model_ids(model) {
+        if seen.insert(candidate.clone()) {
+            models.push((candidate, model_index));
+        }
+    }
+}
+
+fn is_unsafe_auto_fallback_model(provider: &str, model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if provider.eq_ignore_ascii_case("openrouter") && is_openrouter_aggregate_model(model) {
+        return true;
+    }
+
+    lower.contains("embed")
+        || lower.contains("embedding")
+        || lower.contains("guard")
+        || lower.contains("moderation")
+        || lower.contains("rerank")
+        || lower.contains("whisper")
+        || lower.contains("tts")
+        || lower.contains("audio")
+        || lower.contains("image")
+        || lower.contains("vision")
+}
+
+fn auto_fallback_model_score(provider: &str, model: &str) -> (u32, String) {
+    let lower = model.to_ascii_lowercase();
+    let mut score = 100u32;
+
+    if provider.eq_ignore_ascii_case("opencode") {
+        score = score.saturating_sub(20);
+    } else if provider.eq_ignore_ascii_case("github") {
+        score = score.saturating_sub(12);
+    } else if provider.eq_ignore_ascii_case("gemini") {
+        score = score.saturating_sub(10);
+    } else if provider.eq_ignore_ascii_case("nvidia") {
+        score = score.saturating_sub(8);
+    }
+
+    for (needle, bonus) in [
+        ("coder", 30),
+        ("code", 25),
+        ("sonnet", 22),
+        ("claude", 20),
+        ("kimi", 18),
+        ("deepseek", 16),
+        ("qwen", 14),
+        ("mistral", 10),
+        ("llama", 8),
+        ("gemini", 8),
+    ] {
+        if lower.contains(needle) {
+            score = score.saturating_sub(bonus);
+        }
+    }
+
+    for (needle, penalty) in [("1b", 30), ("3b", 20), ("nano", 18), ("mini", 8)] {
+        if lower.contains(needle) {
+            score = score.saturating_add(penalty);
+        }
+    }
+
+    (score, lower)
 }
 
 fn model_for_resolved_provider(provider_name: &str, model: &str) -> String {
@@ -369,6 +505,13 @@ impl Router {
             });
         }
 
+        if is_openrouter_aggregate_model(model) && self.providers.contains_key("openrouter") {
+            return Ok(ResolvedRoute {
+                provider_name: "openrouter".to_string(),
+                model: model.to_string(),
+            });
+        }
+
         // 3. If model contains '/', treat as direct "provider/model" format
         if let Some(slash_pos) = model.find('/') {
             let provider = &model[..slash_pos];
@@ -454,7 +597,6 @@ impl Router {
                 .map(|set| set.contains(model))
                 .unwrap_or(false)
         };
-        let route_models = candidate_model_ids(&route.model);
         let deployment_states = self.deployment_state_map();
         let now = chrono::Utc::now().timestamp();
 
@@ -464,8 +606,8 @@ impl Router {
             .into_iter()
             .enumerate()
         {
-            for model in &route_models {
-                if model_disabled(&provider, model) {
+            for (model, model_index) in self.candidate_models_for_provider(&provider, route) {
+                if model_disabled(&provider, &model) {
                     tracing::debug!(
                         provider = %provider,
                         model = %model,
@@ -474,7 +616,7 @@ impl Router {
                     continue;
                 }
                 candidates.extend(
-                    self.free_candidate_infos_for_model(&provider, model)
+                    self.free_candidate_infos_for_model(&provider, &model)
                         .into_iter()
                         .filter_map(|candidate| {
                             let key_id = key_fingerprint(&candidate.key);
@@ -494,12 +636,13 @@ impl Router {
                                 provider: provider.clone(),
                                 key: candidate.key,
                                 model: model.clone(),
+                                model_index,
                                 provider_index,
                                 usage_sort_key: candidate.usage_sort_key,
                                 fail_count: candidate.fail_count,
                                 total_fail_count: candidate.total_fail_count,
                                 deployment_penalty: deployment_penalty(deployment_state),
-                            })
+                                    })
                         }),
                 );
             }
@@ -508,14 +651,78 @@ impl Router {
         self.order_candidates(candidates, agent_name)
     }
 
+    fn candidate_models_for_provider(
+        &self,
+        provider: &str,
+        route: &ResolvedRoute,
+    ) -> Vec<(String, usize)> {
+        let mut models = Vec::new();
+        let mut seen = HashSet::new();
+        push_candidate_models(&mut models, &mut seen, &route.model, 0);
+
+        for fallback in self.model_fallbacks_for(&route.model) {
+            if !fallback.provider.eq_ignore_ascii_case(provider) {
+                continue;
+            }
+            let model = model_for_resolved_provider(&fallback.provider, &fallback.model);
+            push_candidate_models(&mut models, &mut seen, &model, 1);
+        }
+
+        for model in self.auto_fallback_models_for_provider(provider, &seen) {
+            push_candidate_models(&mut models, &mut seen, &model, 2);
+        }
+
+        models
+    }
+
+    fn auto_fallback_models_for_provider(
+        &self,
+        provider: &str,
+        seen: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .keyhub
+            .available_free_models()
+            .into_iter()
+            .filter_map(|(candidate_provider, model)| {
+                if !candidate_provider.eq_ignore_ascii_case(provider) {
+                    return None;
+                }
+                if seen.contains(&model) || is_unsafe_auto_fallback_model(provider, &model) {
+                    return None;
+                }
+                Some(model)
+            })
+            .collect();
+
+        models.sort_by_key(|model| auto_fallback_model_score(provider, model));
+        models.dedup();
+        models.truncate(4);
+        models
+    }
+
+    fn model_fallbacks_for(&self, model: &str) -> Vec<ModelAlias> {
+        let mut fallbacks = Vec::new();
+        let mut seen = HashSet::new();
+        for key in [model, strip_or_suffixes(model).as_str()] {
+            if let Some(entries) = self.config.model_fallbacks.get(key) {
+                for entry in entries {
+                    let dedupe_key =
+                        format!("{}\n{}", entry.provider.to_ascii_lowercase(), entry.model);
+                    if seen.insert(dedupe_key) {
+                        fallbacks.push(entry.clone());
+                    }
+                }
+            }
+        }
+        fallbacks
+    }
+
     fn free_candidate_infos_for_model(
         &self,
         provider: &str,
         model: &str,
     ) -> Vec<crate::keyhub::FreeKeyCandidate> {
-        if provider.eq_ignore_ascii_case("openrouter") && is_openrouter_native_model(model) {
-            return self.keyhub.free_provider_candidate_infos(provider);
-        }
         self.keyhub.free_candidate_infos(provider, model)
     }
 
@@ -562,6 +769,7 @@ impl Router {
                 candidates.sort_by_key(|candidate| {
                     (
                         candidate.deployment_penalty,
+                        candidate.model_index,
                         candidate.usage_sort_key,
                         candidate.provider_index,
                     )
@@ -571,19 +779,26 @@ impl Router {
                 candidates.sort_by_key(|candidate| {
                     (
                         candidate.deployment_penalty,
+                        candidate.model_index,
                         candidate.fail_count,
                         candidate.total_fail_count.min(u32::MAX as u64) as u32,
+                        candidate.usage_sort_key,
                         candidate.provider_index,
                     )
                 });
             }
             RoutingStrategy::Priority => {
                 candidates.sort_by_key(|candidate| {
-                    (candidate.provider_index, candidate.deployment_penalty)
+                    (
+                        candidate.deployment_penalty,
+                        candidate.model_index,
+                        candidate.provider_index,
+                    )
                 });
             }
             RoutingStrategy::RoundRobin => {
-                candidates.sort_by_key(|candidate| candidate.deployment_penalty);
+                candidates
+                    .sort_by_key(|candidate| (candidate.deployment_penalty, candidate.model_index));
                 let healthy_len = lowest_penalty_prefix_len(&candidates);
                 if healthy_len > 1 {
                     let counter = ROUTER_CANDIDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -592,7 +807,8 @@ impl Router {
                 }
             }
             RoutingStrategy::Random => {
-                candidates.sort_by_key(|candidate| candidate.deployment_penalty);
+                candidates
+                    .sort_by_key(|candidate| (candidate.deployment_penalty, candidate.model_index));
                 let healthy_len = lowest_penalty_prefix_len(&candidates);
                 if healthy_len > 1 {
                     let shift = rand::random::<usize>() % healthy_len;
@@ -880,6 +1096,11 @@ impl Router {
                         prompt_tokens,
                         completion_tokens,
                     );
+                    // Update learned rate limits from upstream response headers
+                    if let Some(ref rate_limits) = response.rate_limits {
+                        self.keyhub
+                            .update_observed_limit(&provider_name, &api_key, rate_limits);
+                    }
                     record_model_usage(
                         &self.model_meta,
                         &provider_name,
@@ -919,8 +1140,17 @@ impl Router {
                 }
                 Err(e) => {
                     let status_code = e.http_status();
-                    self.keyhub
-                        .report_gateway_error(&provider_name, &api_key, &e);
+                    let keywide_cooldown_seconds = report_real_model_key_cooldown(
+                        &self.keyhub,
+                        &provider_name,
+                        &api_key,
+                        &upstream_model,
+                        &e,
+                    );
+                    if keywide_cooldown_seconds.is_none() {
+                        self.keyhub
+                            .report_gateway_error(&provider_name, &api_key, &e);
+                    }
                     // Record failure reason for metadata learning
                     if let Some(ref meta) = self.model_meta {
                         meta.learn_from_failure(
@@ -941,7 +1171,8 @@ impl Router {
                         e.category(),
                         Some(status_code),
                         Some(&e.to_string()),
-                        Some(self.config.routing.cooldown_seconds as i64),
+                        keywide_cooldown_seconds
+                            .or(Some(self.config.routing.cooldown_seconds as i64)),
                         attempt_index + 1 < attempt_count,
                     );
                     if is_provider_model_mismatch(&e) {
@@ -1073,6 +1304,32 @@ impl Router {
                         return Ok(response);
                     }
                     Err(e) => {
+                        let keywide_cooldown_seconds = report_real_model_key_cooldown(
+                            &self.keyhub,
+                            &provider,
+                            &emergency_key,
+                            &route.model,
+                            &e,
+                        );
+                        if keywide_cooldown_seconds.is_none() {
+                            self.keyhub
+                                .report_gateway_error(&provider, &emergency_key, &e);
+                        }
+                        record_request_attempt(
+                            &self.model_meta,
+                            request_id,
+                            (attempt_count + 1) as i64,
+                            &provider,
+                            &route.model,
+                            &emergency_key,
+                            false,
+                            e.category(),
+                            Some(e.http_status()),
+                            Some(&e.to_string()),
+                            keywide_cooldown_seconds
+                                .or(Some(self.config.routing.cooldown_seconds as i64)),
+                            true,
+                        );
                         tracing::warn!(
                             request_id,
                             provider = %provider,
@@ -1174,6 +1431,31 @@ impl Router {
                             return Ok(response);
                         }
                         Err(e) => {
+                            let keywide_cooldown_seconds = report_real_model_key_cooldown(
+                                &self.keyhub,
+                                provider,
+                                &paid_key,
+                                &route.model,
+                                &e,
+                            );
+                            if keywide_cooldown_seconds.is_none() {
+                                self.keyhub.report_gateway_error(provider, &paid_key, &e);
+                            }
+                            record_request_attempt(
+                                &self.model_meta,
+                                request_id,
+                                (attempt_count + 2) as i64,
+                                provider,
+                                &route.model,
+                                &paid_key,
+                                false,
+                                e.category(),
+                                Some(e.http_status()),
+                                Some(&e.to_string()),
+                                keywide_cooldown_seconds
+                                    .or(Some(self.config.routing.cooldown_seconds as i64)),
+                                true,
+                            );
                             tracing::warn!(
                                 request_id,
                                 provider = %provider,
@@ -1427,8 +1709,17 @@ impl Router {
                 }
                 Err(e) => {
                     let status_code = e.http_status();
-                    self.keyhub
-                        .report_gateway_error(&provider_name, &api_key, &e);
+                    let keywide_cooldown_seconds = report_real_model_key_cooldown(
+                        &self.keyhub,
+                        &provider_name,
+                        &api_key,
+                        &upstream_model,
+                        &e,
+                    );
+                    if keywide_cooldown_seconds.is_none() {
+                        self.keyhub
+                            .report_gateway_error(&provider_name, &api_key, &e);
+                    }
                     // Record failure reason for metadata learning
                     if let Some(ref meta) = self.model_meta {
                         meta.learn_from_failure(
@@ -1449,7 +1740,8 @@ impl Router {
                         e.category(),
                         Some(status_code),
                         Some(&e.to_string()),
-                        Some(self.config.routing.cooldown_seconds as i64),
+                        keywide_cooldown_seconds
+                            .or(Some(self.config.routing.cooldown_seconds as i64)),
                         attempt_index + 1 < attempt_count,
                     );
                     if is_provider_model_mismatch(&e) {
@@ -1541,6 +1833,17 @@ impl Router {
                         ));
                     }
                     Err(e) => {
+                        let keywide_cooldown_seconds = report_real_model_key_cooldown(
+                            &self.keyhub,
+                            &provider,
+                            &emergency_key,
+                            &upstream_model,
+                            &e,
+                        );
+                        if keywide_cooldown_seconds.is_none() {
+                            self.keyhub
+                                .report_gateway_error(&provider, &emergency_key, &e);
+                        }
                         record_request_attempt(
                             &self.model_meta,
                             request_id,
@@ -1552,7 +1855,8 @@ impl Router {
                             e.category(),
                             Some(e.http_status()),
                             Some(&e.to_string()),
-                            Some(self.config.routing.cooldown_seconds as i64),
+                            keywide_cooldown_seconds
+                                .or(Some(self.config.routing.cooldown_seconds as i64)),
                             true,
                         );
                         tracing::warn!(
@@ -1621,6 +1925,16 @@ impl Router {
                             ));
                         }
                         Err(e) => {
+                            let keywide_cooldown_seconds = report_real_model_key_cooldown(
+                                &self.keyhub,
+                                provider,
+                                &paid_key,
+                                &upstream_model,
+                                &e,
+                            );
+                            if keywide_cooldown_seconds.is_none() {
+                                self.keyhub.report_gateway_error(provider, &paid_key, &e);
+                            }
                             record_request_attempt(
                                 &self.model_meta,
                                 request_id,
@@ -1632,7 +1946,8 @@ impl Router {
                                 e.category(),
                                 Some(e.http_status()),
                                 Some(&e.to_string()),
-                                Some(self.config.routing.cooldown_seconds as i64),
+                                keywide_cooldown_seconds
+                                    .or(Some(self.config.routing.cooldown_seconds as i64)),
                                 true,
                             );
                             tracing::warn!(
@@ -2323,8 +2638,9 @@ mod tests {
                 provider: "a".to_string(),
                 key: "key-a".to_string(),
                 model: "model".to_string(),
+                model_index: 0,
                 provider_index: 0,
-                usage_sort_key: (0, 0, 0, 0, 0),
+                usage_sort_key: (0, 0, 0, 0, 0, 0),
                 fail_count: 0,
                 total_fail_count: 0,
                 deployment_penalty: 0,
@@ -2333,8 +2649,9 @@ mod tests {
                 provider: "b".to_string(),
                 key: "key-b".to_string(),
                 model: "model".to_string(),
+                model_index: 0,
                 provider_index: 1,
-                usage_sort_key: (0, 0, 0, 0, 0),
+                usage_sort_key: (0, 0, 0, 0, 0, 0),
                 fail_count: 0,
                 total_fail_count: 0,
                 deployment_penalty: 0,
@@ -2343,8 +2660,9 @@ mod tests {
                 provider: "c".to_string(),
                 key: "key-c".to_string(),
                 model: "model".to_string(),
+                model_index: 0,
                 provider_index: 2,
-                usage_sort_key: (0, 0, 0, 0, 0),
+                usage_sort_key: (0, 0, 0, 0, 0, 0),
                 fail_count: 0,
                 total_fail_count: 0,
                 deployment_penalty: 100,
@@ -2399,6 +2717,7 @@ mod tests {
                 );
                 m
             },
+            model_fallbacks: HashMap::new(),
             providers: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2434,6 +2753,7 @@ mod tests {
             cors: Default::default(),
             adaptive_routing: Default::default(),
             context_compression: Default::default(),
+            logging: Default::default(),
         }
     }
 

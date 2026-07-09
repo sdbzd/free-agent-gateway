@@ -232,33 +232,7 @@ pub async fn admin_status(State(state): State<AppState>) -> Json<serde_json::Val
             "base_url": config.map(|c| &c.base_url),
             "priority": config.map(|c| c.priority).unwrap_or(0),
             "last_error": if hs.last_error.is_empty() { serde_json::Value::Null } else { json!(hs.last_error) },
-            "keys": keys_for_provider.into_iter().map(|k| json!({
-                "key_id": k.key_id,
-                "key": k.masked_key(),
-                "tier": k.tier,
-                "status": k.status,
-                "success_count": k.success_count,
-                "fail_count": k.fail_count,
-                "total_fail_count": k.total_fail_count,
-                "last_success_at": k.last_success_at,
-                "last_error_at": k.last_error_at,
-                "last_error_status": k.last_error_status,
-                "status_updated_at": k.status_updated_at,
-                "last_recovered_at": k.last_recovered_at,
-                "rpm_limit": k.rpm_limit,
-                "rpd_limit": k.rpd_limit,
-                "rpm_limit_source": k.rpm_limit_source.clone(),
-                "rpd_limit_source": k.rpd_limit_source.clone(),
-                "tpm_limit": k.tpm_limit,
-                "tpd_limit": k.tpd_limit,
-                "rpm_count": k.rpm_count,
-                "rpd_count": k.rpd_count,
-                "tpm_total": k.tpm_prompt_count + k.tpm_completion_count,
-                "tpd_total": k.tpd_prompt_count + k.tpd_completion_count,
-                "rate_usage": key_rate_usage_json(&k),
-                "cooldown_until": k.cooldown_until,
-                "models": k.models,
-            })).collect::<Vec<_>>(),
+            "keys": keys_for_provider.into_iter().map(admin_key_status_json).collect::<Vec<_>>(),
         }));
     }
 
@@ -991,6 +965,9 @@ pub async fn admin_provider_key_restore(
                     "last_error_status": key.last_error_status,
                     "status_updated_at": key.status_updated_at,
                     "last_recovered_at": key.last_recovered_at,
+                    "availability_reason": key.availability_reason,
+                    "availability_model": key.availability_model,
+                    "next_probe_at": key.next_probe_at,
                 },
             }))
         }
@@ -1281,6 +1258,9 @@ pub async fn admin_keys(State(state): State<AppState>) -> Json<serde_json::Value
                     "last_error_status": k.last_error_status,
                     "status_updated_at": k.status_updated_at,
                     "last_recovered_at": k.last_recovered_at,
+                    "availability_reason": k.availability_reason,
+                    "availability_model": k.availability_model,
+                    "next_probe_at": k.next_probe_at,
                     "cooldown_until": k.cooldown_until,
                     "models": k.models,
                     "rate_limits": {
@@ -1393,6 +1373,43 @@ fn key_rate_usage_json(k: &crate::models::KeyState) -> serde_json::Value {
         } else {
             None
         },
+    })
+}
+
+fn admin_key_status_json(k: crate::models::KeyState) -> serde_json::Value {
+    let key = k.masked_key();
+    let tpm_total = k.tpm_prompt_count + k.tpm_completion_count;
+    let tpd_total = k.tpd_prompt_count + k.tpd_completion_count;
+    let rate_usage = key_rate_usage_json(&k);
+    json!({
+        "key_id": k.key_id,
+        "key": key,
+        "tier": k.tier,
+        "status": k.status,
+        "success_count": k.success_count,
+        "fail_count": k.fail_count,
+        "total_fail_count": k.total_fail_count,
+        "last_success_at": k.last_success_at,
+        "last_error_at": k.last_error_at,
+        "last_error_status": k.last_error_status,
+        "status_updated_at": k.status_updated_at,
+        "last_recovered_at": k.last_recovered_at,
+        "availability_reason": k.availability_reason,
+        "availability_model": k.availability_model,
+        "next_probe_at": k.next_probe_at,
+        "rpm_limit": k.rpm_limit,
+        "rpd_limit": k.rpd_limit,
+        "rpm_limit_source": k.rpm_limit_source,
+        "rpd_limit_source": k.rpd_limit_source,
+        "tpm_limit": k.tpm_limit,
+        "tpd_limit": k.tpd_limit,
+        "rpm_count": k.rpm_count,
+        "rpd_count": k.rpd_count,
+        "tpm_total": tpm_total,
+        "tpd_total": tpd_total,
+        "rate_usage": rate_usage,
+        "cooldown_until": k.cooldown_until,
+        "models": k.models,
     })
 }
 

@@ -438,6 +438,15 @@ pub struct KeyState {
     /// Last time this key automatically recovered from cooldown/rate-limit.
     #[serde(default)]
     pub last_recovered_at: Option<u64>,
+    /// Human-readable availability reason for the current non-available state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_reason: Option<String>,
+    /// Model that last triggered the current availability state, if model-specific evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_model: Option<String>,
+    /// Next time this key should be eligible for a recovery probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_probe_at: Option<u64>,
     /// Total successful requests.
     pub success_count: u64,
     /// Total failed requests.
@@ -576,6 +585,9 @@ impl KeyState {
             last_error_status: None,
             status_updated_at: Some(now),
             last_recovered_at: None,
+            availability_reason: None,
+            availability_model: None,
+            next_probe_at: None,
             success_count: 0,
             total_fail_count: 0,
             rpm_limit: None,

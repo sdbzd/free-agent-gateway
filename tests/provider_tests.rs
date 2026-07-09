@@ -7,6 +7,7 @@ use free_agent_gateway::providers::traits::Provider;
 use free_agent_gateway::providers::{
     create_provider, github_models, nvidia, ollama, openai_compatible,
 };
+use mockito::Matcher;
 
 fn mock_provider_config(base_url: &str, ptype: ProviderType) -> ProviderConfig {
     ProviderConfig {
@@ -113,6 +114,64 @@ async fn test_openai_compatible_chat() {
         .as_str()
         .unwrap();
     assert_eq!(content, "Hello!");
+}
+
+#[tokio::test]
+async fn test_openai_compatible_strips_unsupported_fields_and_clamps_max_tokens() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/chat/completions")
+        .match_body(Matcher::Json(serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 65536
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let provider = openai_compatible::OpenAiCompatibleProvider::new(
+        "cerebras",
+        &mock_provider_config(&server.url(), ProviderType::OpenaiCompatible),
+    );
+
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": "enabled", "budget_tokens": 1024}),
+    );
+
+    let request = ChatCompletionRequest {
+        model: "gpt-4o-mini".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: serde_json::json!("Hi"),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }],
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: None,
+        stop: None,
+        max_tokens: Some(200_000),
+        presence_penalty: None,
+        frequency_penalty: None,
+        user: None,
+        request_id: None,
+        agent_name: None,
+        extra,
+    };
+
+    let response = provider.chat("test-key", request).await.unwrap();
+    assert_eq!(response.status, 200);
+    mock.assert_async().await;
 }
 
 #[tokio::test]

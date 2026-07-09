@@ -410,6 +410,7 @@ mod tests {
             fallback: vec!["cached".into()],
             agents: HashMap::new(),
             models: HashMap::new(),
+            model_fallbacks: HashMap::new(),
             providers: HashMap::from([(
                 "cached".into(),
                 ProviderConfig {
@@ -428,6 +429,7 @@ mod tests {
             cors: CorsConfig::default(),
             adaptive_routing: Default::default(),
             context_compression: Default::default(),
+            logging: Default::default(),
         }
     }
 
@@ -514,6 +516,7 @@ mod tests {
                     },
                 ),
             ]),
+            model_fallbacks: HashMap::new(),
             providers: HashMap::from([(
                 "shared".into(),
                 ProviderConfig {
@@ -536,6 +539,7 @@ mod tests {
             cors: CorsConfig::default(),
             adaptive_routing: Default::default(),
             context_compression: Default::default(),
+            logging: Default::default(),
         };
         let keyhub = KeyHub::new(config.routing.clone());
         keyhub.register_provider("shared", config.providers["shared"].keys.clone());
@@ -577,6 +581,7 @@ mod tests {
                     model: "same-model".into(),
                 },
             )]),
+            model_fallbacks: HashMap::new(),
             providers: HashMap::from([
                 (
                     "first".into(),
@@ -610,6 +615,7 @@ mod tests {
             cors: CorsConfig::default(),
             adaptive_routing: Default::default(),
             context_compression: Default::default(),
+            logging: Default::default(),
         };
         let keyhub = KeyHub::new(config.routing.clone());
         keyhub.register_provider("first", config.providers["first"].keys.clone());

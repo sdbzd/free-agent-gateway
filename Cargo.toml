@@ -1,6 +1,6 @@
 [package]
 name = "free-agent-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Unified OpenAI-compatible gateway for agent workflows"
 license = "MIT"

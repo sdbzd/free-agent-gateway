@@ -144,6 +144,114 @@ fn test_config_parse_providers() {
 }
 
 #[test]
+fn test_config_parse_github_models_provider_limits() {
+    let yaml = r#"
+server: {}
+routing: {}
+fallback:
+  - github
+providers:
+  github:
+    type: github_models
+    enabled: true
+    base_url: https://models.github.ai/inference
+    keys:
+      - value: github-key-a
+        tier: free
+        rpm_limit: 15
+        rpd_limit: 150
+      - value: github-key-b
+        tier: free
+        rpm_limit: 15
+        rpd_limit: 150
+    health_check_model: openai/gpt-4.1-mini
+    timeout_seconds: 30
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+    config.validate().unwrap();
+
+    let github = &config.providers["github"];
+    assert_eq!(github.provider_type, ProviderType::GithubModels);
+    assert_eq!(github.base_url, "https://models.github.ai/inference");
+    assert_eq!(github.keys.len(), 2);
+    assert_eq!(github.keys[0].rpm_limit(), Some(15));
+    assert_eq!(github.keys[0].rpd_limit(), Some(150));
+    assert_eq!(github.keys[1].tier(), KeyTier::Free);
+}
+
+#[test]
+fn test_config_parse_gemini_provider() {
+    let yaml = r#"
+server: {}
+routing: {}
+fallback:
+  - gemini
+providers:
+  gemini:
+    type: gemini
+    enabled: true
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    keys:
+      - value: gemini-key-a
+        tier: free
+        rpm_limit: 12
+      - value: gemini-key-b
+        tier: free
+        rpm_limit: 12
+    health_check_model: gemini-3.1-flash-lite
+    timeout_seconds: 60
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+    config.validate().unwrap();
+
+    let gemini = &config.providers["gemini"];
+    assert_eq!(gemini.provider_type, ProviderType::Gemini);
+    assert_eq!(
+        gemini.base_url,
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+    );
+    assert_eq!(gemini.keys.len(), 2);
+    assert_eq!(gemini.keys[0].rpm_limit(), Some(12));
+    assert_eq!(gemini.keys[1].tier(), KeyTier::Free);
+}
+
+#[test]
+fn test_config_parse_huggingface_provider() {
+    let yaml = r#"
+server: {}
+routing: {}
+fallback:
+  - huggingface
+providers:
+  huggingface:
+    type: huggingface
+    enabled: true
+    base_url: https://router.huggingface.co/v1
+    keys:
+      - value: hf-key-a
+        tier: free
+        rpm_limit: 10
+      - value: hf-key-b
+        tier: free
+        rpm_limit: 10
+    health_check_model: ""
+    timeout_seconds: 30
+"#;
+
+    let config = Config::from_str_yaml(yaml).unwrap();
+    config.validate().unwrap();
+
+    let huggingface = &config.providers["huggingface"];
+    assert_eq!(huggingface.provider_type, ProviderType::HuggingFace);
+    assert_eq!(huggingface.base_url, "https://router.huggingface.co/v1");
+    assert_eq!(huggingface.keys.len(), 2);
+    assert_eq!(huggingface.keys[0].rpm_limit(), Some(10));
+    assert_eq!(huggingface.keys[1].tier(), KeyTier::Free);
+}
+
+#[test]
 fn test_config_env_var_expansion() {
     // SAFETY: single-threaded test, no other threads reading the env.
     unsafe {
@@ -453,7 +561,7 @@ fn test_persisted_state_restores_only_matching_configured_keys() {
     restored.restore_provider_states("github", &persisted);
 
     let snapshot = restored.snapshot().remove(0).1;
-    let disabled = snapshot
+    let recovered = snapshot
         .iter()
         .find(|state| state.key_id == key_fingerprint("key-a"))
         .unwrap();
@@ -462,8 +570,9 @@ fn test_persisted_state_restores_only_matching_configured_keys() {
         .find(|state| state.key_id == key_fingerprint("key-new"))
         .unwrap();
 
-    assert_eq!(disabled.status, KeyStatus::Disabled);
-    assert_eq!(disabled.models, vec!["model-a"]);
+    assert_eq!(recovered.status, KeyStatus::Available);
+    assert_eq!(recovered.models, vec!["model-a"]);
+    assert!(recovered.last_recovered_at.is_some());
     assert_eq!(fresh.status, KeyStatus::Available);
 
     let mut unknown = KeyState::new("removed-key".into());

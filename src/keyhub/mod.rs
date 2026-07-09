@@ -17,9 +17,14 @@ use crate::config::{KeyConfig, KeyTier, RoutingConfig, RoutingStrategy};
 use crate::error::{GatewayError, GatewayResult};
 use crate::models::{KeyState, KeyStatus};
 
-/// Escalating cooldown durations for 429 rate-limit hits (like freellmapi).
-/// First hit → 2 min, second → 10 min, third → 1 hour, 4+ → 24 hours.
-const COOLDOWN_ESCALATION_S: &[u64] = &[120, 600, 3600, 86400];
+/// Escalating cooldown durations for 429 rate-limit hits.
+/// Short and pragmatic: avoid burning quota on long cooldowns when
+/// daily limits reset frequently.
+/// First hit → 30s, second → 2 min, third → 10 min, 4+ → 20 min.
+const COOLDOWN_ESCALATION_S: &[u64] = &[30, 120, 600, 1200];
+/// Default key-wide recovery window for strong real-model availability failures.
+/// Cap at 1h — 24h wastes an entire daily quota window.
+pub const REAL_MODEL_RECOVERY_COOLDOWN_S: u64 = 3600;
 
 /// Global counter for round-robin key selection.
 static ROUND_ROBIN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29,7 +34,7 @@ static ROUND_ROBIN_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeKeyCandidate {
     pub key: String,
-    pub usage_sort_key: (u32, u32, u32, u32, u32),
+    pub usage_sort_key: (u32, u32, u32, u32, u32, u32),
     pub fail_count: u32,
     pub total_fail_count: u64,
 }
@@ -86,18 +91,33 @@ fn key_usage_score(key: &KeyState, now_secs: u64) -> u32 {
     rpm_pct.max(rpd_pct).max(tpm_pct).max(tpd_pct)
 }
 
-fn key_usage_sort_key(key: &KeyState, now_secs: u64) -> (u32, u32, u32, u32, u32) {
+fn key_usage_sort_key(key: &KeyState, now_secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let now_min = now_secs / 60;
     let now_day = now_secs / 86400;
     let minute_count = current_minute_count(key.rpm_window_start, key.rpm_count, now_min);
     let day_count = current_day_count(key.rpd_window_start, key.rpd_count, now_day);
     (
         key_usage_score(key, now_secs),
+        key_capacity_penalty(key),
         day_count,
         minute_count,
         key.fail_count,
         key.total_fail_count.min(u32::MAX as u64) as u32,
     )
+}
+
+fn key_capacity_penalty(key: &KeyState) -> u32 {
+    let request_capacity = key
+        .rpd_limit
+        .unwrap_or(0)
+        .saturating_mul(100)
+        .saturating_add(key.rpm_limit.unwrap_or(0));
+    let token_capacity = key
+        .tpd_limit
+        .unwrap_or(0)
+        .saturating_add(key.tpm_limit.unwrap_or(0));
+    let capacity = request_capacity.max(token_capacity);
+    u32::MAX.saturating_sub(capacity)
 }
 
 fn current_minute_count(window_start: u64, count: u32, now_min: u64) -> u32 {
@@ -120,7 +140,10 @@ fn is_request_selectable(key: &KeyState, now_secs: u64) -> bool {
         && !key.is_rate_limited(now_secs)
 }
 
-fn key_usage_sort_key_for_selection(key: &KeyState, now_secs: u64) -> (u32, u32, u32, u32, u32) {
+fn key_usage_sort_key_for_selection(
+    key: &KeyState,
+    now_secs: u64,
+) -> (u32, u32, u32, u32, u32, u32) {
     let mut sort_key = key_usage_sort_key(key, now_secs);
     if key.status == KeyStatus::Probing {
         sort_key.0 = sort_key.0.saturating_add(1000);
@@ -257,6 +280,7 @@ impl KeyPool {
     /// Restore persisted operational metadata onto configured keys.
     pub fn restore_states(&self, persisted: &[KeyState]) {
         let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
         for configured in keys.iter_mut() {
             let configured_id = key_fingerprint(&configured.key);
             let Some(saved) = persisted.iter().find(|saved| {
@@ -281,6 +305,9 @@ impl KeyPool {
             configured.last_error_status = saved.last_error_status;
             configured.status_updated_at = saved.status_updated_at;
             configured.last_recovered_at = saved.last_recovered_at;
+            configured.availability_reason = saved.availability_reason.clone();
+            configured.availability_model = saved.availability_model.clone();
+            configured.next_probe_at = saved.next_probe_at;
             configured.success_count = saved.success_count;
             configured.total_fail_count = saved.total_fail_count;
             if configured.rpm_limit.is_none() {
@@ -300,6 +327,14 @@ impl KeyPool {
             configured.rpm_window_start = saved.rpm_window_start;
             configured.rpd_window_start = saved.rpd_window_start;
             configured.key_id = configured_id;
+            if configured.status == KeyStatus::Disabled && !configured.models.is_empty() {
+                configured.status = KeyStatus::Available;
+                configured.fail_count = 0;
+                configured.cooldown_until = None;
+                configured.next_probe_at = None;
+                configured.status_updated_at = Some(now);
+                configured.last_recovered_at = Some(now);
+            }
         }
         self.recover_expired(&mut keys);
     }
@@ -314,6 +349,9 @@ impl KeyPool {
                         key.status = KeyStatus::Available;
                         key.fail_count = 0;
                         key.cooldown_until = None;
+                        key.next_probe_at = None;
+                        key.availability_reason = None;
+                        key.availability_model = None;
                         key.status_updated_at = Some(now);
                         key.last_recovered_at = Some(now);
                         tracing::info!(
@@ -328,6 +366,7 @@ impl KeyPool {
                         // (2min → 10min → 1hr → 24hr) persists across recovery cycles
                         key.status = KeyStatus::Probing;
                         key.cooldown_until = None;
+                        key.next_probe_at = None;
                         key.status_updated_at = Some(now);
                         key.last_recovered_at = Some(now);
                         tracing::info!(
@@ -365,6 +404,9 @@ impl KeyPool {
             {
                 k.status = KeyStatus::Available;
                 k.cooldown_until = None;
+                k.next_probe_at = None;
+                k.availability_reason = None;
+                k.availability_model = None;
                 k.status_updated_at = Some(now);
             }
 
@@ -439,6 +481,9 @@ impl KeyPool {
             {
                 k.status = KeyStatus::Available;
                 k.cooldown_until = None;
+                k.next_probe_at = None;
+                k.availability_reason = None;
+                k.availability_model = None;
                 k.status_updated_at = Some(now);
             }
             k.reset_rate_windows(now);
@@ -485,6 +530,9 @@ impl KeyPool {
             k.total_fail_count = k.total_fail_count.saturating_add(1);
             k.status = KeyStatus::Cooldown;
             k.cooldown_until = Some(now + self.routing.cooldown_seconds);
+            k.next_probe_at = k.cooldown_until;
+            k.availability_reason = Some(reason.to_string());
+            k.availability_model = None;
             k.status_updated_at = Some(now);
             tracing::warn!(
                 provider = %self.provider_name,
@@ -496,6 +544,70 @@ impl KeyPool {
             );
         }
         self.record_provider_failure(keys.len() as u64, now);
+    }
+
+    /// Place a key into recovery cooldown after a failure from a real requested model.
+    ///
+    /// Two behaviours depending on the failure reason:
+    /// - `"real_model_rate_limited"` (model-level RPM/RPD limit): records the failure
+    ///   and sets model-level evidence but does NOT change the key status, so other
+    ///   models on the same key remain usable. The per-model cooldown is handled by
+    ///   the deployment_state table in metadata.
+    /// - `"real_model_unavailable"` (key-wide quota/credit exhaustion): marks the
+    ///   entire key as RateLimited so all models pause.
+    pub fn report_real_model_failure(
+        &self,
+        key: &str,
+        http_status: u16,
+        model: &str,
+        reason: &str,
+        retry_after_seconds: Option<u64>,
+    ) {
+        let mut keys = self.keys.write();
+        let now = chrono::Utc::now().timestamp() as u64;
+        if let Some(k) = keys.iter_mut().find(|k| k.key == key) {
+            let cooldown_s = retry_after_seconds
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(REAL_MODEL_RECOVERY_COOLDOWN_S);
+            k.last_error_at = Some(now);
+            k.last_error_status = Some(http_status);
+            k.fail_count = k.fail_count.saturating_add(1);
+            k.total_fail_count = k.total_fail_count.saturating_add(1);
+            k.availability_reason = Some(reason.to_string());
+            k.availability_model = Some(model.to_string());
+            k.status_updated_at = Some(now);
+
+            if reason == "real_model_unavailable" {
+                // Key-wide exhaustion (daily quota, credits, billing)
+                // → mark the entire key as RateLimited
+                k.status = KeyStatus::RateLimited;
+                k.cooldown_until = Some(now + cooldown_s);
+                k.next_probe_at = k.cooldown_until;
+                tracing::warn!(
+                    provider = %self.provider_name,
+                    key = %k.masked_key(),
+                    model,
+                    status = http_status,
+                    reason,
+                    cooldown_s,
+                    "Key entering real-model recovery cooldown (key-wide)"
+                );
+            } else {
+                // Model-specific rate limit (e.g. "model X: 20 RPM exceeded")
+                // → keep the key Available for other models.
+                // Per-model cooldown is enforced by deployment_state in metadata.
+                k.cooldown_until = None;
+                k.next_probe_at = None;
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    key = %k.masked_key(),
+                    model,
+                    status = http_status,
+                    reason,
+                    "Model-level rate limit recorded, key stays available for other models"
+                );
+            }
+        }
     }
 
     /// Report a failure with optional upstream retry guidance.
@@ -515,6 +627,9 @@ impl KeyPool {
                     // Auth failure → permanently disabled
                     k.status = KeyStatus::Disabled;
                     k.status_updated_at = Some(now);
+                    k.next_probe_at = None;
+                    k.availability_reason = Some("auth_failed".to_string());
+                    k.availability_model = None;
                     k.total_fail_count += 1;
                     tracing::warn!(
                         provider = %self.provider_name,
@@ -561,6 +676,9 @@ impl KeyPool {
                     let cooldown_s = retry_after_seconds.unwrap_or(COOLDOWN_ESCALATION_S[tier]);
                     k.status = KeyStatus::RateLimited;
                     k.cooldown_until = Some(now + cooldown_s);
+                    k.next_probe_at = k.cooldown_until;
+                    k.availability_reason = Some("rate_limited".to_string());
+                    k.availability_model = None;
                     k.status_updated_at = Some(now);
                     k.fail_count += 1;
                     k.total_fail_count += 1;
@@ -599,6 +717,9 @@ impl KeyPool {
         if key.fail_count >= self.routing.fail_threshold {
             key.status = KeyStatus::Cooldown;
             key.cooldown_until = Some(now + self.routing.cooldown_seconds);
+            key.next_probe_at = key.cooldown_until;
+            key.availability_reason = Some("transient_failures".to_string());
+            key.availability_model = None;
             key.status_updated_at = Some(now);
             tracing::warn!(
                 provider = %self.provider_name,
@@ -664,6 +785,9 @@ impl KeyPool {
                 last_error_status: k.last_error_status,
                 status_updated_at: k.status_updated_at,
                 last_recovered_at: k.last_recovered_at,
+                availability_reason: k.availability_reason.clone(),
+                availability_model: k.availability_model.clone(),
+                next_probe_at: k.next_probe_at,
                 success_count: k.success_count,
                 total_fail_count: k.total_fail_count,
                 rpm_limit: k.rpm_limit,
@@ -703,6 +827,9 @@ impl KeyPool {
         key.status = KeyStatus::Available;
         key.fail_count = 0;
         key.cooldown_until = None;
+        key.next_probe_at = None;
+        key.availability_reason = None;
+        key.availability_model = None;
         key.status_updated_at = Some(now);
         key.last_recovered_at = Some(now);
 
@@ -729,6 +856,9 @@ impl KeyPool {
             last_error_status: key.last_error_status,
             status_updated_at: key.status_updated_at,
             last_recovered_at: key.last_recovered_at,
+            availability_reason: key.availability_reason.clone(),
+            availability_model: key.availability_model.clone(),
+            next_probe_at: key.next_probe_at,
             success_count: key.success_count,
             total_fail_count: key.total_fail_count,
             rpm_limit: key.rpm_limit,
@@ -746,6 +876,78 @@ impl KeyPool {
             rpm_window_start: key.rpm_window_start,
             rpd_window_start: key.rpd_window_start,
         })
+    }
+
+    /// Update learned rate limits from upstream response headers.
+    /// Called after a successful request when the provider returned
+    /// X-RateLimit-* headers. Tightens observed limits but never relaxes them.
+    pub fn update_observed_limits(
+        &self,
+        key: &str,
+        limits: &crate::providers::traits::RateLimitInfo,
+    ) {
+        let mut keys = self.keys.write();
+        let Some(k) = keys.iter_mut().find(|k| k.key == key) else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp() as u64;
+        k.reset_rate_windows(now);
+        let now_min = now / 60;
+        let now_day = now / 86400;
+        let rpm_sent = current_minute_count(k.rpm_window_start, k.rpm_count, now_min);
+        let _rpd_sent = current_day_count(k.rpd_window_start, k.rpd_count, now_day);
+
+        // If provider tells us the absolute limit, tighten to it
+        if let Some(limit) = limits.rpm_limit {
+            if can_observed_limit_update(&k.rpm_limit_source) {
+                tighten_observed_limit(&mut k.rpm_limit, limit);
+                if k.rpm_limit.is_some() {
+                    k.rpm_limit_source = Some("response_headers".to_string());
+                }
+            }
+        }
+        // If provider tells us remaining, infer limit = remaining + sent
+        if let Some(remaining) = limits.rpm_remaining {
+            if can_observed_limit_update(&k.rpm_limit_source) {
+                let inferred = rpm_sent.saturating_add(remaining);
+                tighten_observed_limit(&mut k.rpm_limit, inferred);
+                if k.rpm_limit.is_some() {
+                    k.rpm_limit_source = Some("response_headers".to_string());
+                }
+            }
+        }
+
+        // Token limits
+        if let Some(limit) = limits.tpm_limit {
+            if k.tpm_limit.is_none() || limit < k.tpm_limit.unwrap() {
+                k.tpm_limit = Some(limit);
+            }
+        }
+        if let Some(remaining) = limits.tpm_remaining {
+            let current_tpm = k.tpm_prompt_count.saturating_add(k.tpm_completion_count);
+            let inferred = current_tpm.saturating_add(remaining);
+            if k.tpm_limit.is_none() || inferred < k.tpm_limit.unwrap() {
+                k.tpm_limit = Some(inferred);
+            }
+        }
+
+        // Infer daily limit when remaining is near-zero and we've sent a lot
+        if limits.rpm_remaining.is_some_and(|r| r <= 2) && rpm_sent >= 5 {
+            tighten_observed_limit(&mut k.rpd_limit, rpm_sent);
+            if k.rpd_limit.is_some() {
+                k.rpd_limit_source = Some("response_headers".to_string());
+            }
+        }
+
+        tracing::debug!(
+            provider = %self.provider_name,
+            key = %k.masked_key(),
+            rpm_limit = ?k.rpm_limit,
+            rpm_limit_source = ?k.rpm_limit_source,
+            rpd_limit = ?k.rpd_limit,
+            tpm_limit = ?k.tpm_limit,
+            "Updated observed rate limits from response headers"
+        );
     }
 }
 
@@ -814,6 +1016,18 @@ impl KeyHub {
         }
     }
 
+    /// Update rate limits from upstream response headers for a specific key.
+    pub fn update_observed_limit(
+        &self,
+        provider_name: &str,
+        key: &str,
+        limits: &crate::providers::traits::RateLimitInfo,
+    ) {
+        if let Some(pool) = self.pools.get(provider_name) {
+            pool.update_observed_limits(key, limits);
+        }
+    }
+
     /// Report failure for a provider's key.
     pub fn report_failure(&self, provider_name: &str, key: &str, http_status: u16) {
         self.report_failure_with_retry_after(provider_name, key, http_status, None);
@@ -836,6 +1050,21 @@ impl KeyHub {
     ) {
         if let Some(pool) = self.pools.get(provider_name) {
             pool.force_transient_cooldown(key, http_status, reason);
+        }
+    }
+
+    /// Put a key into a key-wide recovery cooldown for a real requested model failure.
+    pub fn report_real_model_failure(
+        &self,
+        provider_name: &str,
+        key: &str,
+        http_status: u16,
+        model: &str,
+        reason: &str,
+        retry_after_seconds: Option<u64>,
+    ) {
+        if let Some(pool) = self.pools.get(provider_name) {
+            pool.report_real_model_failure(key, http_status, model, reason, retry_after_seconds);
         }
     }
 
@@ -950,6 +1179,42 @@ impl KeyHub {
         rpd_limit: Option<u32>,
         source: &str,
     ) -> bool {
+        self._apply_sync(provider_name, key, rpm_limit, rpd_limit, None, None, source)
+    }
+
+    /// Apply RPM, RPD, TPM, and TPD limits from an authoritative source (config or official API).
+    /// Returns true if any limit was updated.
+    pub fn apply_all_limits(
+        &self,
+        provider_name: &str,
+        key: &str,
+        rpm_limit: Option<u32>,
+        rpd_limit: Option<u32>,
+        tpm_limit: Option<u32>,
+        tpd_limit: Option<u32>,
+        source: &str,
+    ) -> bool {
+        self._apply_sync(
+            provider_name,
+            key,
+            rpm_limit,
+            rpd_limit,
+            tpm_limit,
+            tpd_limit,
+            source,
+        )
+    }
+
+    fn _apply_sync(
+        &self,
+        provider_name: &str,
+        key: &str,
+        rpm_limit: Option<u32>,
+        rpd_limit: Option<u32>,
+        tpm_limit: Option<u32>,
+        tpd_limit: Option<u32>,
+        source: &str,
+    ) -> bool {
         let Some(pool) = self.pools.get(provider_name) else {
             return false;
         };
@@ -972,6 +1237,17 @@ impl KeyHub {
                 limit,
                 source,
             );
+        }
+        // Token limits — only apply if source is "official_api" (authoritative)
+        if let Some(limit) = tpm_limit {
+            if source == "official_api" || state.tpm_limit.is_none() {
+                state.tpm_limit = Some(limit);
+            }
+        }
+        if let Some(limit) = tpd_limit {
+            if source == "official_api" || state.tpd_limit.is_none() {
+                state.tpd_limit = Some(limit);
+            }
         }
         true
     }
@@ -1159,6 +1435,7 @@ impl KeyHub {
                     (
                         candidate.fail_count,
                         candidate.total_fail_count.min(u32::MAX as u64) as u32,
+                        candidate.usage_sort_key,
                     )
                 });
             }
@@ -1226,7 +1503,8 @@ impl KeyHub {
                     .filter(|key| {
                         key.tier == KeyTier::Free
                             && is_request_selectable(key, now)
-                            && key.models.iter().any(|candidate| candidate == model)
+                            && (provider_name == "cloudflare"
+                                || key.models.iter().any(|candidate| candidate == model))
                     })
                     .map(|key| FreeKeyCandidate {
                         key: key.key.clone(),

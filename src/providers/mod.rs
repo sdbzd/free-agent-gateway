@@ -2,6 +2,7 @@
 ///
 /// Each provider (GitHub Models, NVIDIA NIM, OpenAI-compatible, Ollama)
 /// implements the `Provider` trait.
+pub mod cloudflare;
 pub mod github_models;
 pub mod nvidia;
 pub mod ollama;
@@ -77,6 +78,7 @@ pub fn create_provider(
 ) -> crate::error::GatewayResult<BoxedProvider> {
     match config.provider_type {
         crate::config::ProviderType::GithubModels
+        | crate::config::ProviderType::Gemini
         | crate::config::ProviderType::HuggingFace
         | crate::config::ProviderType::Nvidia
         | crate::config::ProviderType::OpenaiCompatible => Ok(Box::new(
@@ -84,6 +86,9 @@ pub fn create_provider(
         )),
         crate::config::ProviderType::Ollama => {
             Ok(Box::new(ollama::OllamaProvider::new(name, config)))
+        }
+        crate::config::ProviderType::Cloudflare => {
+            Ok(Box::new(cloudflare::CloudflareProvider::new(name, config)))
         }
     }
 }

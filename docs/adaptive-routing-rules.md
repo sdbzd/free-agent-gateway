@@ -288,6 +288,16 @@ A non-streaming upstream response is only considered successful if it contains e
 
 If a non-streaming provider returns an empty completion, the router records it as an upstream failure, updates key/model failure learning, and tries the next fallback candidate.
 
+## Provider Request Normalization
+
+Before forwarding chat completions to OpenAI-compatible upstream providers, the gateway normalizes the request body for strict providers:
+
+- strips non-standard gateway/client fields known to trigger upstream 400s, including `provider` and `thinking`;
+- clamps `max_tokens` above `65536` down to `65536`, because several free-compatible providers reject larger values instead of truncating them;
+- keeps standard OpenAI chat fields and flattened extension fields unless they are known to break strict upstream compatibility.
+
+Provider/model failure learning also treats invalid-model diagnostics such as `not a valid model ID`, `invalid model ID`, `unknown model`, `No such model`, and `model_not_found` as `not_found` evidence. This helps the router avoid repeatedly burning attempts on concrete model IDs that an upstream has already rejected.
+
 Tool-call normalization rules:
 
 - Non-streaming `tool_calls[].function.arguments` must be a string before returning to clients.

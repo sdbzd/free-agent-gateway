@@ -139,10 +139,21 @@ impl Watcher {
         }
 
         let interval = std::time::Duration::from_secs(self.config.watcher.interval_seconds);
+        let min_interval =
+            std::time::Duration::from_secs(self.config.watcher.min_interval_seconds.max(10));
+        let jitter_percent = self.config.watcher.jitter_percent.clamp(0.0, 0.95);
 
         loop {
             self.check_all().await;
-            tokio::time::sleep(interval).await;
+            // Add random jitter to avoid fixed-interval background quota probes.
+            let jitter = (rand::random::<f64>() * 2.0 * jitter_percent - jitter_percent)
+                * interval.as_secs_f64();
+            let sleep_dur = if jitter >= 0.0 {
+                interval.saturating_add(std::time::Duration::from_secs_f64(jitter))
+            } else {
+                interval.saturating_sub(std::time::Duration::from_secs_f64(-jitter))
+            };
+            tokio::time::sleep(std::cmp::max(sleep_dur, min_interval)).await;
         }
     }
 }
@@ -301,16 +312,21 @@ mod tests {
             fallback: vec!["opencode".into()],
             agents: HashMap::new(),
             models: HashMap::new(),
+            model_fallbacks: HashMap::new(),
             providers,
             watcher: WatcherConfig {
                 enabled: true,
+                startup_check: false,
                 interval_seconds: 600,
+                min_interval_seconds: 10,
+                jitter_percent: 0.0,
                 check_timeout_seconds: 5,
             },
             state: Default::default(),
             cors: Default::default(),
             adaptive_routing: Default::default(),
             context_compression: Default::default(),
+            logging: Default::default(),
         }
     }
 

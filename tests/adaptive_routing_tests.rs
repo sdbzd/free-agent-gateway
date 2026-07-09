@@ -121,6 +121,7 @@ fn adaptive_config() -> Arc<Config> {
             auto_discover: true,
         },
         fallback: vec!["openrouter".into(), "nvidia".into()],
+        model_fallbacks: HashMap::new(),
         agents: HashMap::new(),
         models: HashMap::new(),
         providers: HashMap::from([
@@ -156,6 +157,7 @@ fn adaptive_config() -> Arc<Config> {
         cors: Default::default(),
         adaptive_routing: adaptive,
         context_compression: Default::default(),
+        logging: Default::default(),
     })
 }
 

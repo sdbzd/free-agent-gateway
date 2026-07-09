@@ -3,12 +3,14 @@ use async_trait::async_trait;
 use crate::config::ProviderConfig;
 use crate::error::{GatewayError, GatewayResult, parse_retry_after_value};
 use crate::models::ChatCompletionRequest;
+use crate::providers::traits::extract_rate_limit_headers;
 use crate::providers::traits::{ChatResponse, Provider, StreamResponse};
 use crate::providers::{http_client, send_stream_request, streaming_client_with_proxy};
 
 /// Fields that the OpenAI spec does not define and that some OpenAI-compatible
 /// providers (e.g. Cerebras) reject as unsupported parameters.
-const UNSUPPORTED_EXTRA_FIELDS: &[&str] = &["provider"];
+const UNSUPPORTED_EXTRA_FIELDS: &[&str] = &["provider", "thinking"];
+const MAX_SAFE_COMPLETION_TOKENS: u32 = 65_536;
 
 /// Remove known unsupported fields from the request's `extra` map before
 /// serializing and sending to the upstream provider. This prevents errors
@@ -16,6 +18,20 @@ const UNSUPPORTED_EXTRA_FIELDS: &[&str] = &["provider"];
 fn strip_unsupported_extra_fields(request: &mut ChatCompletionRequest) {
     for field in UNSUPPORTED_EXTRA_FIELDS {
         request.extra.remove(*field);
+    }
+}
+
+fn clamp_request_limits(provider: &str, request: &mut ChatCompletionRequest) {
+    if let Some(max_tokens) = request.max_tokens
+        && max_tokens > MAX_SAFE_COMPLETION_TOKENS
+    {
+        tracing::debug!(
+            provider,
+            requested_max_tokens = max_tokens,
+            clamped_max_tokens = MAX_SAFE_COMPLETION_TOKENS,
+            "Clamping max_tokens before upstream request"
+        );
+        request.max_tokens = Some(MAX_SAFE_COMPLETION_TOKENS);
     }
 }
 
@@ -173,6 +189,7 @@ impl Provider for OpenAiCompatibleProvider {
         mut request: ChatCompletionRequest,
     ) -> GatewayResult<ChatResponse> {
         strip_unsupported_extra_fields(&mut request);
+        clamp_request_limits(&self.name, &mut request);
         let url = format!("{}/chat/completions", self.base_url);
         let client = http_client(self.timeout_seconds, self.proxy_url.as_deref())?;
         let resp = client
@@ -184,6 +201,8 @@ impl Provider for OpenAiCompatibleProvider {
             .send()
             .await?;
 
+        // Extract rate-limit headers from the response before consuming the body
+        let rate_limits = extract_rate_limit_headers(resp.headers());
         let (status, is_success, retry_after_seconds, body) =
             parse_json_body(resp, &self.name, "chat/completions").await?;
         if !is_success {
@@ -200,7 +219,7 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(GatewayError::http_error(status, msg, retry_after_seconds));
         }
 
-        Ok(ChatResponse { body, status })
+        Ok(ChatResponse::new(body, status, Some(rate_limits)))
     }
 
     async fn chat_stream(
@@ -209,6 +228,7 @@ impl Provider for OpenAiCompatibleProvider {
         mut request: ChatCompletionRequest,
     ) -> GatewayResult<StreamResponse> {
         strip_unsupported_extra_fields(&mut request);
+        clamp_request_limits(&self.name, &mut request);
         let mut stream_request = request.clone();
         stream_request.stream = Some(true);
 
@@ -268,6 +288,7 @@ impl Provider for OpenAiCompatibleProvider {
             .send()
             .await?;
 
+        let rate_limits = extract_rate_limit_headers(resp.headers());
         let (status, is_success, retry_after_seconds, body) =
             parse_json_body(resp, &self.name, endpoint).await?;
         if !is_success {
@@ -283,7 +304,7 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(GatewayError::http_error(status, msg, retry_after_seconds));
         }
 
-        Ok(ChatResponse { body, status })
+        Ok(ChatResponse::new(body, status, Some(rate_limits)))
     }
 }
 

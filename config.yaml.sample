@@ -12,6 +12,15 @@ server:
   # SSE keep-alive interval in seconds
   sse_keepalive: 15
 
+# File logging: console output stays enabled; files roll daily and are cleaned
+# by age and total size so long-running gateways do not grow without bound.
+logging:
+  file_enabled: true
+  directory: "logs"
+  file_prefix: "gateway.log"
+  retention_days: 14
+  max_total_mb: 256
+
 # Routing strategy: round_robin, random, least_failed, least_rate, priority
 routing:
   strategy: "least_failed"
@@ -131,14 +140,24 @@ providers:
   github:
     type: "github_models"
     enabled: false
-    base_url: "https://models.inference.ai.azure.com"
+    base_url: "https://models.github.ai/inference"
     # Keys rotate automatically on failure
     keys:
-      - "${GITHUB_TOKEN_1}"
-      - "${GITHUB_TOKEN_2}"
-      - "${GITHUB_TOKEN_3}"
+      - value: "${GITHUB_TOKEN_1}"
+        tier: free
+        # GitHub Models free limits vary by model tier.
+        rpm_limit: 15
+        rpd_limit: 150
+      - value: "${GITHUB_TOKEN_2}"
+        tier: free
+        rpm_limit: 15
+        rpd_limit: 150
+      - value: "${GITHUB_TOKEN_3}"
+        tier: free
+        rpm_limit: 15
+        rpd_limit: 150
     # Health check settings
-    #health_check_model: "openai/gpt-4.1-mini"
+    health_check_model: "openai/gpt-4.1-mini"
     timeout_seconds: 30
 
   nvidia:
@@ -186,12 +205,33 @@ providers:
     enabled: false
     base_url: "https://router.huggingface.co/v1"
     keys:
-      - value: "${HF_TOKEN}"
+      - value: "${HF_TOKEN_1}"
         tier: free
+        # Hugging Face free usage is credit-based; keep RPM conservative.
+        rpm_limit: 10
+      - value: "${HF_TOKEN_2}"
+        tier: free
+        rpm_limit: 10
     # Optional: set to a known HF router model after Refresh Models has
     # confirmed it for your key. Otherwise Test/Validate uses discovered inventory.
     health_check_model: ""
     timeout_seconds: 30
+
+  gemini:
+    # Google Gemini OpenAI-compatible API.
+    type: "gemini"
+    enabled: false
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+    keys:
+      - value: "${GEMINI_API_KEY_1}"
+        tier: free
+        # Tune this to the limit shown in AI Studio. Keep a small buffer.
+        rpm_limit: 12
+      - value: "${GEMINI_API_KEY_2}"
+        tier: free
+        rpm_limit: 12
+    health_check_model: "gemini-3.1-flash-lite"
+    timeout_seconds: 60
 
   ollama:
     type: "ollama"
@@ -232,15 +272,21 @@ adaptive_routing:
       provider_groups: ["free-cloud"]
   routing_groups:
     free-cloud:
-      providers: ["openrouter", "nvidia", "groq", "huggingface", "cloudflare"]
+      providers: ["openrouter", "github", "nvidia", "gemini", "groq", "huggingface", "cloudflare"]
     coding:
       providers: ["openrouter", "nvidia"]
 
 # Health watcher settings
 watcher:
   enabled: true
-  # Check interval in seconds
-  interval_seconds: 600
+  # Skip startup probing by default; refreshes consume upstream request quota.
+  startup_check: false
+  # Average background model refresh interval in seconds.
+  interval_seconds: 7200
+  # Never refresh more often than this, even after jitter.
+  min_interval_seconds: 3600
+  # Randomize each interval by +/- this fraction.
+  jitter_percent: 0.5
   # Timeout for each health check
   check_timeout_seconds: 10
 

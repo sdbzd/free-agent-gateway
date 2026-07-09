@@ -142,10 +142,7 @@ impl Provider for OllamaProvider {
         let ollama_body: serde_json::Value = resp.json().await?;
         let openai_body = convert_ollama_to_openai(&ollama_body, &request.model);
 
-        Ok(ChatResponse {
-            body: openai_body,
-            status: 200,
-        })
+        Ok(ChatResponse::new(openai_body, 200, None))
     }
 
     async fn chat_stream(

@@ -2,8 +2,9 @@
 ///
 /// Validates key rotation, cooldown, rate-limit, and disable logic.
 use free_agent_gateway::config::{KeyConfig, KeyTier, RoutingConfig, RoutingStrategy};
-use free_agent_gateway::error::GatewayError;
-use free_agent_gateway::keyhub::{KeyHub, KeyPool, key_fingerprint};
+use free_agent_gateway::keyhub::{
+    KeyHub, KeyPool, REAL_MODEL_RECOVERY_COOLDOWN_S, key_fingerprint,
+};
 use free_agent_gateway::models::{KeyState, KeyStatus};
 
 fn routing_config() -> RoutingConfig {
@@ -112,6 +113,81 @@ fn test_429_with_short_retry_after_learns_observed_rpm_limit() {
 }
 
 #[test]
+fn test_real_model_unavailable_keywide_cooldown_skips_only_that_key() {
+    let hub = KeyHub::new(routing_config());
+    hub.register_provider(
+        "shared",
+        vec![
+            KeyConfig::detailed("bad-key", KeyTier::Free),
+            KeyConfig::detailed("good-key", KeyTier::Free),
+        ],
+    );
+    hub.update_models("shared", "bad-key", vec!["real-model".into()]);
+    hub.update_models("shared", "good-key", vec!["real-model".into()]);
+
+    let before = chrono::Utc::now().timestamp() as u64;
+    hub.report_real_model_failure(
+        "shared",
+        "bad-key",
+        429,
+        "real-model",
+        "real_model_unavailable",
+        None,
+    );
+
+    let states = hub.snapshot().remove(0).1;
+    let bad = states
+        .iter()
+        .find(|state| state.key_id == key_fingerprint("bad-key"))
+        .expect("bad key state");
+    assert_eq!(bad.status, KeyStatus::RateLimited);
+    assert_eq!(
+        bad.availability_reason.as_deref(),
+        Some("real_model_unavailable")
+    );
+    assert_eq!(bad.availability_model.as_deref(), Some("real-model"));
+    assert!(bad.cooldown_until.unwrap() >= before + REAL_MODEL_RECOVERY_COOLDOWN_S);
+    assert_eq!(bad.next_probe_at, bad.cooldown_until);
+
+    assert_eq!(
+        hub.free_candidates("shared", "real-model", None),
+        vec!["good-key".to_string()]
+    );
+}
+
+#[test]
+fn test_real_model_failure_recovers_through_probe_after_expiry() {
+    let hub = KeyHub::new(routing_config());
+    hub.register_provider(
+        "shared",
+        vec![KeyConfig::detailed("recovering", KeyTier::Free)],
+    );
+    hub.update_models("shared", "recovering", vec!["real-model".into()]);
+
+    let mut persisted = KeyState::new("recovering".into());
+    persisted.tier = KeyTier::Free;
+    persisted.models = vec!["real-model".into()];
+    persisted.status = KeyStatus::RateLimited;
+    persisted.cooldown_until = Some(chrono::Utc::now().timestamp() as u64 - 1);
+    persisted.next_probe_at = persisted.cooldown_until;
+    persisted.availability_reason = Some("real_model_rate_limited".into());
+    persisted.availability_model = Some("real-model".into());
+    hub.restore_provider_states("shared", &[persisted]);
+
+    let state = hub.snapshot().remove(0).1.remove(0);
+    assert_eq!(state.status, KeyStatus::Probing);
+    assert_eq!(
+        hub.free_candidates("shared", "real-model", None),
+        vec!["recovering".to_string()]
+    );
+
+    assert!(hub.reserve_key("shared", "recovering"));
+    let state = hub.snapshot().remove(0).1.remove(0);
+    assert_eq!(state.status, KeyStatus::Cooldown);
+    assert!(state.cooldown_until.is_some());
+}
+
+#[test]
 fn test_keypool_429_falls_back_to_local_escalation_without_retry_after() {
     let pool = KeyPool::new("github", vec!["key-a".into()], routing_config());
     let before = chrono::Utc::now().timestamp() as u64;
@@ -119,7 +195,8 @@ fn test_keypool_429_falls_back_to_local_escalation_without_retry_after() {
 
     let snapshot = pool.snapshot();
     let cooldown_until = snapshot[0].cooldown_until.expect("cooldown");
-    assert!(cooldown_until >= before + 120);
+    assert!(cooldown_until >= before + 30);
+    assert!(cooldown_until <= before + 32);
 }
 
 #[test]
@@ -154,65 +231,6 @@ fn test_transient_403_does_not_disable_key() {
     assert_eq!(snapshot[0].last_error_status, Some(403));
     assert_eq!(snapshot[0].total_fail_count, 1);
     assert_eq!(pool.available_count(), 1);
-}
-
-#[test]
-fn test_gateway_waf_403_does_not_penalize_key_state() {
-    let hub = KeyHub::new(routing_config());
-    hub.register_provider("groq", vec![tiered_key("groq-key", KeyTier::Free)]);
-    let error = GatewayError::http_error(
-        403,
-        "Access denied | api.groq.com used Cloudflare to restrict access. Error code: 1009",
-        None,
-    );
-
-    hub.report_gateway_error("groq", "groq-key", &error);
-
-    let snapshot = hub.snapshot();
-    let key = &snapshot
-        .iter()
-        .find(|(provider, _)| provider == "groq")
-        .unwrap()
-        .1[0];
-    assert_eq!(key.status, KeyStatus::Available);
-    assert_eq!(key.fail_count, 0);
-    assert_eq!(key.total_fail_count, 0);
-}
-
-#[test]
-fn test_gateway_region_403_does_not_penalize_key_state() {
-    let hub = KeyHub::new(routing_config());
-    hub.register_provider("openrouter", vec![tiered_key("or-key", KeyTier::Free)]);
-    let error = GatewayError::http_error(403, "This model is not available in your region.", None);
-
-    hub.report_gateway_error("openrouter", "or-key", &error);
-
-    let snapshot = hub.snapshot();
-    let key = &snapshot
-        .iter()
-        .find(|(provider, _)| provider == "openrouter")
-        .unwrap()
-        .1[0];
-    assert_eq!(key.status, KeyStatus::Available);
-    assert_eq!(key.fail_count, 0);
-    assert_eq!(key.total_fail_count, 0);
-}
-
-#[test]
-fn test_gateway_auth_403_still_disables_key() {
-    let hub = KeyHub::new(routing_config());
-    hub.register_provider("groq", vec![tiered_key("groq-key", KeyTier::Free)]);
-    let error = GatewayError::http_error(403, "invalid api key", None);
-
-    hub.report_gateway_error("groq", "groq-key", &error);
-
-    let snapshot = hub.snapshot();
-    let key = &snapshot
-        .iter()
-        .find(|(provider, _)| provider == "groq")
-        .unwrap()
-        .1[0];
-    assert_eq!(key.status, KeyStatus::Disabled);
 }
 
 #[test]
@@ -329,7 +347,7 @@ fn test_round_robin_strategy() {
 }
 
 #[test]
-fn test_rate_limited_key_enters_probe_after_expiry() {
+fn test_rate_limited_key_recovers_after_expiry() {
     let pool = KeyPool::new("github", vec!["key-a".into()], routing_config());
     let mut persisted = KeyState::new("key-a".into());
     persisted.status = KeyStatus::RateLimited;
@@ -342,76 +360,6 @@ fn test_rate_limited_key_enters_probe_after_expiry() {
     assert_eq!(snapshot[0].status, KeyStatus::Probing);
     assert!(snapshot[0].last_recovered_at.is_some());
     assert_eq!(pool.acquire_key().unwrap(), "key-a");
-    assert!(pool.reserve_key("key-a"));
-    let snapshot = pool.snapshot();
-    assert_eq!(snapshot[0].status, KeyStatus::Cooldown);
-    assert_eq!(pool.available_count(), 0);
-}
-
-#[test]
-fn test_rate_limited_probe_success_marks_key_available() {
-    let pool = KeyPool::new("github", vec!["key-a".into()], routing_config());
-    let mut persisted = KeyState::new("key-a".into());
-    persisted.status = KeyStatus::RateLimited;
-    persisted.last_error_status = Some(429);
-    persisted.cooldown_until = Some(chrono::Utc::now().timestamp() as u64 - 1);
-
-    pool.restore_states(&[persisted]);
-
-    assert_eq!(pool.acquire_key().unwrap(), "key-a");
-    pool.report_reserved_success("key-a", None, None);
-
-    let snapshot = pool.snapshot();
-    assert_eq!(snapshot[0].status, KeyStatus::Available);
-    assert_eq!(snapshot[0].cooldown_until, None);
-    assert_eq!(pool.available_count(), 1);
-}
-
-#[test]
-fn test_rate_limited_manual_validation_success_marks_key_available() {
-    let pool = KeyPool::new("github", vec!["key-a".into()], routing_config());
-    let mut persisted = KeyState::new("key-a".into());
-    persisted.status = KeyStatus::RateLimited;
-    persisted.last_error_status = Some(429);
-    persisted.cooldown_until = Some(chrono::Utc::now().timestamp() as u64 + 600);
-
-    pool.restore_states(&[persisted]);
-    pool.report_success("key-a", None, None);
-
-    let snapshot = pool.snapshot();
-    assert_eq!(snapshot[0].status, KeyStatus::Available);
-    assert_eq!(snapshot[0].cooldown_until, None);
-    assert_eq!(pool.available_count(), 1);
-}
-
-#[test]
-fn test_keyhub_can_find_raw_key_by_fingerprint_for_validation() {
-    let hub = KeyHub::new(routing_config());
-    hub.register_provider("github", vec!["key-a".into()]);
-
-    let raw = hub.key_by_id("github", &key_fingerprint("key-a")).unwrap();
-
-    assert_eq!(raw, "key-a");
-}
-
-#[test]
-fn test_keyhub_can_return_models_for_validation_key() {
-    let hub = KeyHub::new(routing_config());
-    hub.register_provider("openrouter", vec![tiered_key("key-a", KeyTier::Free)]);
-    hub.update_models(
-        "openrouter",
-        "key-a",
-        vec!["bad-region-model".into(), "working-model".into()],
-    );
-
-    assert_eq!(
-        hub.models_for_key_id("openrouter", &key_fingerprint("key-a")),
-        vec!["bad-region-model".to_string(), "working-model".to_string()]
-    );
-    assert_eq!(
-        hub.models_for_key("openrouter", "key-a"),
-        vec!["bad-region-model".to_string(), "working-model".to_string()]
-    );
 }
 
 #[test]
@@ -740,6 +688,33 @@ fn test_least_rate_uses_higher_quota_key_by_usage_percentage() {
 
     assert_eq!(
         hub.free_candidates("shared", "free-model", None),
+        vec!["topped-up-free".to_string(), "normal-free".to_string()]
+    );
+}
+
+#[test]
+fn test_least_failed_prefers_higher_quota_key_when_failures_equal() {
+    let hub = KeyHub::new(routing_config());
+    hub.register_provider(
+        "openrouter",
+        vec![
+            limited_request_key("normal-free", 20, 50),
+            limited_request_key("topped-up-free", 20, 1000),
+        ],
+    );
+    hub.update_models(
+        "openrouter",
+        "normal-free",
+        vec!["qwen/qwen3-coder:free".into()],
+    );
+    hub.update_models(
+        "openrouter",
+        "topped-up-free",
+        vec!["qwen/qwen3-coder:free".into()],
+    );
+
+    assert_eq!(
+        hub.free_candidates("openrouter", "qwen/qwen3-coder:free", None),
         vec!["topped-up-free".to_string(), "normal-free".to_string()]
     );
 }

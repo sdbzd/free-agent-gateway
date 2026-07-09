@@ -3,7 +3,7 @@ use std::sync::Arc;
 ///
 /// Single EXE deployment. No Docker, no Kubernetes, no external databases.
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Router as AxumRouter,
@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
 
@@ -36,7 +37,7 @@ use free_agent_gateway::{
         chat_completions, completions, embeddings, health, list_models, metrics,
         metrics_prometheus, responses, status,
     },
-    config::Config,
+    config::{Config, LoggingConfig},
     health::HealthRegistry,
     keyhub::KeyHub,
     metadata::{ModelMetaStore, sync::SyncScheduler},
@@ -54,7 +55,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 async fn main() -> anyhow::Result<()> {
     // ─── Initialize tracing ────────────────────────────────────────
     let config = Config::load("config.yaml")?;
-    init_tracing(&config.server.log_level);
+    let _log_guard = init_tracing(&config.server.log_level, &config.logging);
+    start_log_cleanup_task(config.logging.clone());
 
     tracing::info!("🦀 free-agent-gateway v{}", VERSION);
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -181,6 +183,12 @@ async fn main() -> anyhow::Result<()> {
     let _openrouter_rule_sync =
         start_openrouter_key_rule_sync(keyhub.clone(), reqwest::Client::new());
 
+    // Cloudflare limits sync disabled: the /ai/limits endpoint requires
+    // a different API scope/token and returns 400 with current credentials.
+    // Will re-enable once the correct Cloudflare billing/limits API is identified.
+    // let _cloudflare_rule_sync =
+    //     start_cloudflare_key_rule_sync(keyhub.clone(), reqwest::Client::new());
+
     // ─── Spawn watcher background task ─────────────────────────────
     let watcher = Arc::new(Watcher::new(
         config.clone(),
@@ -193,10 +201,14 @@ async fn main() -> anyhow::Result<()> {
         watcher_task.run().await;
     });
 
-    // ─── Initial model discovery on startup ─────────────────────────
-    tracing::info!("Running initial model discovery...");
-    watcher.check_all().await;
-    tracing::info!("Initial model discovery complete");
+    // ─── Optional initial model discovery on startup ────────────────
+    if config.watcher.startup_check {
+        tracing::info!("Running initial model discovery...");
+        watcher.check_all().await;
+        tracing::info!("Initial model discovery complete");
+    } else {
+        tracing::info!("Initial model discovery skipped by watcher.startup_check=false");
+    }
 
     // ─── Spawn in-memory state sync task (NO disk I/O) ───────────────
     // The background sync only keeps the in-memory PersistedState up-to-date.
@@ -370,22 +382,149 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Initialize the tracing subscriber.
-fn init_tracing(level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(
-                    level
-                        .to_lowercase()
-                        .parse()
-                        .unwrap_or_else(|_| tracing::Level::INFO.into()),
-                )
-                .from_env_lossy(),
+fn init_tracing(
+    level: &str,
+    logging: &LoggingConfig,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(
+            level
+                .to_lowercase()
+                .parse()
+                .unwrap_or_else(|_| tracing::Level::INFO.into()),
         )
+        .from_env_lossy();
+
+    let console_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
+        .compact();
+
+    if !logging.file_enabled {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .init();
+        return None;
+    }
+
+    if let Err(error) = std::fs::create_dir_all(&logging.directory) {
+        eprintln!(
+            "failed to create log directory '{}': {error}; file logging disabled",
+            logging.directory
+        );
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .init();
+        return None;
+    }
+
+    let file_appender = tracing_appender::rolling::daily(&logging.directory, &logging.file_prefix);
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_writer)
+        .with_ansi(false)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .compact();
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
         .init();
+
+    Some(guard)
+}
+
+fn start_log_cleanup_task(logging: LoggingConfig) {
+    if !logging.file_enabled || (logging.retention_days == 0 && logging.max_total_mb == 0) {
+        return;
+    }
+
+    cleanup_log_files(&logging);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+        loop {
+            interval.tick().await;
+            cleanup_log_files(&logging);
+        }
+    });
+}
+
+fn cleanup_log_files(logging: &LoggingConfig) {
+    if let Err(error) = cleanup_log_files_inner(logging) {
+        tracing::warn!(error = %error, "Failed to clean up old log files");
+    }
+}
+
+fn cleanup_log_files_inner(logging: &LoggingConfig) -> std::io::Result<()> {
+    let dir = Path::new(&logging.directory);
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || !is_gateway_log_file(&path, &logging.file_prefix) {
+            continue;
+        }
+
+        let metadata = entry.metadata()?;
+        files.push(LogFile {
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+
+    if logging.retention_days > 0 {
+        let cutoff = SystemTime::now()
+            .checked_sub(Duration::from_secs(logging.retention_days * 24 * 60 * 60))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        files.retain(|file| {
+            if file.modified < cutoff {
+                let _ = std::fs::remove_file(&file.path);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    if logging.max_total_mb > 0 {
+        let max_total_bytes = logging.max_total_mb.saturating_mul(1024 * 1024);
+        files.sort_by_key(|file| std::cmp::Reverse(file.modified));
+        let mut total = 0u64;
+        for file in files {
+            total = total.saturating_add(file.len);
+            if total > max_total_bytes {
+                let _ = std::fs::remove_file(file.path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_gateway_log_file(path: &Path, file_prefix: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == file_prefix || name.starts_with(&format!("{file_prefix}.")))
+        .unwrap_or(false)
+}
+
+struct LogFile {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
 }
 
 /// Build CORS middleware layer from config.

@@ -18,6 +18,8 @@ pub struct Config {
     pub agents: HashMap<String, AgentConfig>,
     #[serde(default)]
     pub models: HashMap<String, ModelAlias>,
+    #[serde(default)]
+    pub model_fallbacks: HashMap<String, Vec<ModelAlias>>,
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub watcher: WatcherConfig,
@@ -29,6 +31,8 @@ pub struct Config {
     pub adaptive_routing: AdaptiveRoutingConfig,
     #[serde(default)]
     pub context_compression: ContextCompressionConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 // ─── Server ─────────────────────────────────────────────────────────
@@ -61,6 +65,50 @@ fn default_timeout() -> u64 {
 }
 fn default_sse_keepalive() -> u64 {
     15
+}
+
+// ─── Logging ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LoggingConfig {
+    #[serde(default = "default_true")]
+    pub file_enabled: bool,
+    #[serde(default = "default_log_directory")]
+    pub directory: String,
+    #[serde(default = "default_log_file_prefix")]
+    pub file_prefix: String,
+    #[serde(default = "default_log_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_log_max_total_mb")]
+    pub max_total_mb: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            file_enabled: true,
+            directory: default_log_directory(),
+            file_prefix: default_log_file_prefix(),
+            retention_days: default_log_retention_days(),
+            max_total_mb: default_log_max_total_mb(),
+        }
+    }
+}
+
+fn default_log_directory() -> String {
+    "logs".into()
+}
+
+fn default_log_file_prefix() -> String {
+    "gateway.log".into()
+}
+
+fn default_log_retention_days() -> u64 {
+    14
+}
+
+fn default_log_max_total_mb() -> u64 {
+    256
 }
 
 // ─── Context Compression ───────────────────────────────────────────────
@@ -266,10 +314,12 @@ pub struct ModelAlias {
 pub enum ProviderType {
     GithubModels,
     Nvidia,
+    Gemini,
     #[serde(rename = "huggingface", alias = "hugging_face")]
     HuggingFace,
     OpenaiCompatible,
     Ollama,
+    Cloudflare,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -277,9 +327,11 @@ impl std::fmt::Display for ProviderType {
         match self {
             Self::GithubModels => write!(f, "github_models"),
             Self::Nvidia => write!(f, "nvidia"),
+            Self::Gemini => write!(f, "gemini"),
             Self::HuggingFace => write!(f, "huggingface"),
             Self::OpenaiCompatible => write!(f, "openai_compatible"),
             Self::Ollama => write!(f, "ollama"),
+            Self::Cloudflare => write!(f, "cloudflare"),
         }
     }
 }
@@ -424,14 +476,26 @@ fn default_provider_timeout() -> u64 {
 pub struct WatcherConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub startup_check: bool,
     #[serde(default = "default_watcher_interval")]
     pub interval_seconds: u64,
+    #[serde(default = "default_watcher_min_interval")]
+    pub min_interval_seconds: u64,
+    #[serde(default = "default_watcher_jitter_percent")]
+    pub jitter_percent: f64,
     #[serde(default = "default_watcher_timeout")]
     pub check_timeout_seconds: u64,
 }
 
 fn default_watcher_interval() -> u64 {
-    600
+    7200
+}
+fn default_watcher_min_interval() -> u64 {
+    3600
+}
+fn default_watcher_jitter_percent() -> f64 {
+    0.5
 }
 fn default_watcher_timeout() -> u64 {
     10
@@ -547,6 +611,32 @@ impl Config {
                     "model alias '{alias_name}' references unknown provider '{}'",
                     alias.provider
                 )));
+            }
+        }
+
+        for (model, fallbacks) in &self.model_fallbacks {
+            if model.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "model_fallbacks keys must not be empty".into(),
+                ));
+            }
+            for fallback in fallbacks {
+                if fallback.provider.trim().is_empty() {
+                    return Err(GatewayError::Config(format!(
+                        "model_fallbacks for '{model}' must specify a provider"
+                    )));
+                }
+                if !self.providers.contains_key(&fallback.provider) {
+                    return Err(GatewayError::Config(format!(
+                        "model_fallbacks for '{model}' references unknown provider '{}'",
+                        fallback.provider
+                    )));
+                }
+                if fallback.model.trim().is_empty() {
+                    return Err(GatewayError::Config(format!(
+                        "model_fallbacks for '{model}' must specify a model"
+                    )));
+                }
             }
         }
 

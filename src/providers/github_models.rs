@@ -108,7 +108,7 @@ impl Provider for GithubModelsProvider {
             return Err(GatewayError::http_error(status, msg, retry_after_seconds));
         }
 
-        Ok(ChatResponse { body, status })
+        Ok(ChatResponse::new(body, status, None))
     }
 
     async fn chat_stream(

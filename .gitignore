@@ -15,6 +15,7 @@ target-*/
 
 # Runtime state files (generated at startup)
 state.json
+state.json.bak*
 models.cache
 
 # IDE / Editor
@@ -36,6 +37,7 @@ Desktop.ini
 
 # Logs
 *.log
+logs/
 
 config.yaml
 config.yaml.bak*
@@ -73,6 +75,10 @@ web/admin/build/
 
 # OMO session data
 .omo/
+.tmp/
+codex-api-*.js
+request-*.js
+vscode-api-*.js
 
 *.py
 *.json

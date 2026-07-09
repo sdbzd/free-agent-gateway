@@ -1229,16 +1229,20 @@ impl ModelMetaStore {
 
     /// Classify an error message into a category for tracking.
     pub fn classify_error(error_msg: &str, http_status: u16) -> &'static str {
+        let lower = error_msg.to_ascii_lowercase();
         if http_status == 429 {
             "rate_limit"
         } else if http_status == 401 || http_status == 403 {
             "auth"
-        } else if http_status == 404 {
-            "not_found"
-        } else if error_msg.contains("timeout")
-            || error_msg.contains("Time out")
-            || http_status == 504
+        } else if http_status == 404
+            || lower.contains("not a valid model id")
+            || lower.contains("invalid model id")
+            || lower.contains("unknown model")
+            || lower.contains("no such model")
+            || lower.contains("model_not_found")
         {
+            "not_found"
+        } else if lower.contains("timeout") || lower.contains("time out") || http_status == 504 {
             "timeout"
         } else if http_status >= 500 {
             "upstream"
